@@ -21,7 +21,7 @@ anything, no SQL surface beyond a useful subset (see M6). Depth over breadth —
 a small SQL grammar executed correctly and atomically beats a large one
 executed loosely.
 
-## Where things stand (from the initial commit)
+## Where things stand
 
 Already built, in `c/src` / `c/include`, carried over from the db3
 prototype:
@@ -38,8 +38,13 @@ prototype:
   cache's resident set the same way it guards the arena today.
 - [csv.h](../c/include/csv.h) / `csv.c` — RFC 4180 row reader over an
   in-memory buffer.
+- [field.h](../c/include/field.h) / `field.c` — per-cell type inference and
+  validation (`FieldType`: INT/DOUBLE/BOOL/TEXT) over a field's raw string
+  form. This is what M1's `table.c` should call to type each CSV column
+  as it's loaded, and later what a declared `CREATE TABLE` column type (M6)
+  validates incoming values against.
 - `main.c` — currently a placeholder linenoise REPL that echoes input; not
-  wired to arena/budget/csv yet.
+  wired to arena/budget/csv/field yet.
 
 Nothing here does storage-as-a-table, SQL, transactions, or concurrency yet —
 that's the entire subject of this plan.
@@ -68,27 +73,27 @@ that's the entire subject of this plan.
 ## Layered architecture (bottom to top)
 
 ```
- ┌─────────────────────────────────────────────┐
- │  public API (db4.h)  — db4_open/prepare/step │
- ├─────────────────────────────────────────────┤
- │  REPL (main.c)         — thin API client     │
- ├─────────────────────────────────────────────┤
- │  SQL front end   — lexer, parser, AST        │
- │  planner         — AST -> logical -> physical│
- │  execution engine — bytecode VM + cursors    │
- ├─────────────────────────────────────────────┤
- │  catalog / schema — tables, columns, types   │
- ├─────────────────────────────────────────────┤
- │  transaction manager — txn boundaries, locks │
- │  concurrency control  — RW-lock / MVCC       │
- ├─────────────────────────────────────────────┤
- │  storage engine  — table/row access,         │
- │                     durability (WAL/journal) │
- ├─────────────────────────────────────────────┤
- │  pager / CSV loader — pages or CSV buffers   │
- ├─────────────────────────────────────────────┤
- │  arena, budget (done), sds, cJSON, linenoise │
- └─────────────────────────────────────────────┘
+ ┌─────────────────────────────────────────────────────┐
+ │  public API (db4.h)  — db4_open/prepare/step         │
+ ├─────────────────────────────────────────────────────┤
+ │  REPL (main.c)         — thin API client             │
+ ├─────────────────────────────────────────────────────┤
+ │  SQL front end   — lexer, parser, AST                │
+ │  planner         — AST -> logical -> physical        │
+ │  execution engine — bytecode VM + cursors            │
+ ├─────────────────────────────────────────────────────┤
+ │  catalog / schema — tables, columns, types           │
+ ├─────────────────────────────────────────────────────┤
+ │  transaction manager — txn boundaries, locks         │
+ │  concurrency control  — RW-lock / MVCC               │
+ ├─────────────────────────────────────────────────────┤
+ │  storage engine  — table/row access,                 │
+ │                     durability (WAL/journal)         │
+ ├─────────────────────────────────────────────────────┤
+ │  pager / CSV loader — pages or CSV buffers           │
+ ├─────────────────────────────────────────────────────┤
+ │  arena, budget, field (done), sds, cJSON, linenoise  │
+ └─────────────────────────────────────────────────────┘
 ```
 
 Each layer only calls the one below it. The REPL and the eventual public API
@@ -136,10 +141,12 @@ no milestone should require the next one to already exist to be worth having.
 Add `table.c`/`table.h` (referenced but not yet written — see the comment in
 [budget.h](../c/include/budget.h) about "table.c's heap/column growth").
 A `Table` is a set of named, typed columns and a row heap, built by
-streaming a `CsvReader` into it. Column types start minimal — TEXT,
-INTEGER, REAL, NULL — inferred from the CSV values or declared explicitly.
-This is the first thing that turns "a CSV parser" into "a table with rows
-you can address."
+streaming a `CsvReader` into it, using [field.c](../c/src/field.c)'s
+`field_infer_type`/`field_validate` to type and check each cell as it's
+loaded. Column types start minimal — the four `FieldType`s field.c already
+defines (INT, DOUBLE, BOOL, TEXT) — inferred from the CSV values or declared
+explicitly via `field_type_from_name`. This is the first thing that turns
+"a CSV parser" into "a table with rows you can address."
 
 Wire `main.c`'s REPL to `.load <file.csv>`, `.tables`, `.schema <table>`, and
 a `.dump` that writes a table back out as CSV — no SQL yet, just proving the

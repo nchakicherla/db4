@@ -40,14 +40,71 @@ prototype:
   in-memory buffer.
 - [field.h](../c/include/field.h) / `field.c` — per-cell type inference and
   validation (`FieldType`: INT/DOUBLE/BOOL/TEXT) over a field's raw string
-  form. This is what M1's `table.c` should call to type each CSV column
-  as it's loaded, and later what a declared `CREATE TABLE` column type (M6)
-  validates incoming values against.
-- `main.c` — currently a placeholder linenoise REPL that echoes input; not
-  wired to arena/budget/csv/field yet.
+  form. This is what `table.c` calls to type each CSV column as it's loaded,
+  and later what a declared `CREATE TABLE` column type (M6) validates
+  incoming values against.
+- [table.h](../c/include/table.h) / `table.c` and
+  [index.h](../c/include/index.h) / `index.c` — the column-oriented
+  in-memory `Table`, ported from db3's `library-conversion` branch (not the
+  `main` branch's version — that one calls `exit(1)` on OOM, which a library
+  can't do to its host; the `library-conversion` version already speaks the
+  same `ArenaFailure`-latch discipline as arena.c/budget.c here). Fixed-width
+  columns (INT/DOUBLE/BOOL) live inline in per-column arrays; TEXT stores a
+  `StringRef` into a separate append-only heap. Includes tombstone deletes
+  (`table_delete_row`/`table_compact`), one primary key per table backed by
+  a hash index (`index.c`'s `RowIndex`), and foreign-key *declarations*
+  (`table_set_foreign_key`) — more than a minimal row store strictly needs,
+  brought in because it's proven, tested code rather than something to
+  re-derive later.
+- [session.h](../c/include/session.h) / `session.c` — a `Session`: an
+  array of named `Table`s (`.load`/`.tables` need more than one table
+  addressable at once). Ported as-is from db3; this is the same job M2's
+  `catalog.c` is planned to formalize into a connection-scoped registry —
+  for now `Session` *is* the catalog, informally.
+- [schema.h](../c/include/schema.h) / `schema.c` — parses `.load`'s optional
+  JSON schema-override argument (`{"col":"type", "id":{"type":"int",
+  "primary":true, "references":"other.col", ...}}`) into a `SchemaOverride`,
+  using the vendored cJSON. Ported as-is from db3.
+- [load.h](../c/include/load.h) / `load.c` — **M1's CSV-to-`Table` loader**,
+  adapted from db3's `cmd_load`: parses `.load <name> "<path>"
+  [{schema}|"<schema.json>"]`, infers each column's `FieldType` from the
+  first data row (or takes a schema override), streams the rest through
+  `csv_reader_next_row` into a scratch `Table`, and only installs it into
+  the `Session` once every row has passed primary-key/foreign-key
+  validation — a malformed or constraint-violating load is rejected
+  atomically, the scratch table is simply discarded. Also has `dump_csv`
+  (new code, not ported — db3 never had a CSV-dump command) and the
+  `.tables`/`.schema` print helpers. What did *not* come over from
+  `cmd_load`'s home in `commands/common.c`: `cascade_on_delete`/
+  `cascade_on_update`/`check_column_constraints`, which only matter once
+  `UPDATE`/`DELETE` exist (M6) — `load.c` only needs `check_row_constraints`,
+  used once per freshly-loaded row.
+- `main.c` — a linenoise REPL dispatching `.load`, `.tables`, `.schema
+  <table>`, `.dump <table> "<path>"`, `.quit`/`.exit`. **M1 is done**:
+  verified end to end with multi-table loads, a valid foreign key
+  reference, a rejected foreign key reference (atomic failure, confirmed
+  the referencing table never got installed), and a round-trip dump.
 
-Nothing here does storage-as-a-table, SQL, transactions, or concurrency yet —
-that's the entire subject of this plan.
+Nothing here does SQL, transactions, or concurrency yet — that's the entire
+subject of the rest of this plan.
+
+### Stale scaffolding notes
+
+`table_set_foreign_key`/`table_set_primary_key` are now actually enforced
+during `.load` (via `load.c`'s `check_row_constraints`), but only there —
+there's no `UPDATE`/`DELETE` yet (M6) to enforce them against, so
+`cascade_on_delete`/`cascade_on_update` (db3's `commands/common.c`) were
+deliberately not ported; M6 will need to write or re-port that when
+`UPDATE`/`DELETE` exist.
+
+`table_compact`/`table_compact_heap` (reclaiming tombstoned rows / orphaned
+heap bytes) are still unreferenced outside `table.c` — there's still no
+`DELETE`/`UPDATE` yet to produce anything for them to reclaim.
+
+No test suite was ported. db3 has `tests/test_table.c`, `test_index.c`,
+`test_commands_load.c` etc. (part of its ~8,400-assertion suite) covering
+exactly this code; db4 has no test infrastructure yet at all, consistent
+with where this project already stood ("no tests yet").
 
 ## Guiding principles (carry these forward from db3)
 
@@ -136,21 +193,13 @@ around:
 Each milestone should be independently mergeable and independently useful —
 no milestone should require the next one to already exist to be worth having.
 
-### M1 — Table: an in-memory row store over CSV
+### M1 — Table: an in-memory row store over CSV — **done**
 
-Add `table.c`/`table.h` (referenced but not yet written — see the comment in
-[budget.h](../c/include/budget.h) about "table.c's heap/column growth").
-A `Table` is a set of named, typed columns and a row heap, built by
-streaming a `CsvReader` into it, using [field.c](../c/src/field.c)'s
-`field_infer_type`/`field_validate` to type and check each cell as it's
-loaded. Column types start minimal — the four `FieldType`s field.c already
-defines (INT, DOUBLE, BOOL, TEXT) — inferred from the CSV values or declared
-explicitly via `field_type_from_name`. This is the first thing that turns
-"a CSV parser" into "a table with rows you can address."
-
-Wire `main.c`'s REPL to `.load <file.csv>`, `.tables`, `.schema <table>`, and
-a `.dump` that writes a table back out as CSV — no SQL yet, just proving the
-load/inspect/persist loop works end to end.
+See "Where things stand" above for the full breakdown of what's in the
+tree (`table.c`/`index.c`, `session.c`, `schema.c`, `load.c`) and what was
+deliberately left out (UPDATE/DELETE cascades, tests). `main.c`'s REPL
+supports `.load <name> "<path>" [schema]`, `.tables`, `.schema <table>`,
+and `.dump <table> "<path>"`.
 
 ### M2 — Catalog
 
@@ -243,8 +292,9 @@ concurrent *writers*, not just concurrent readers.
 
 | File | Purpose | Milestone |
 |---|---|---|
-| `table.c`/`table.h` | column/row store, built from `CsvRow`s | M1 |
-| `catalog.c`/`catalog.h` | name -> `Table*` registry, connection state | M2 |
+| `table.c`/`table.h`, `index.c`/`index.h` | column/row store + PK hash index (done — ported from db3) | M1 |
+| `session.c`/`session.h`, `schema.c`/`schema.h`, `load.c`/`load.h` | named-table registry, JSON schema overrides, CSV loader/dumper (done — ported/adapted from db3) | M1 |
+| `catalog.c`/`catalog.h` | name -> `Table*` registry, connection state — may just be `session.c` renamed/extended rather than a new file | M2 |
 | `lexer.c`/`lexer.h` | SQL tokenizer | M3 |
 | `parser.c`/`parser.h` | recursive-descent parser -> AST | M3 |
 | `ast.h` | AST node types | M3 |

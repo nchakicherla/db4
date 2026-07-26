@@ -84,13 +84,19 @@ prototype:
   `UPDATE`/`DELETE` exist (M6) — `load.c` only needs `check_row_constraints`,
   used once per freshly-loaded row.
 - `main.c` — a linenoise REPL dispatching `.load`, `.tables`, `.schema
-  <table>`, `.dump <table> "<path>"`, `.quit`/`.exit`. **M1 is done**:
-  verified end to end with multi-table loads, a valid foreign key
-  reference, a rejected foreign key reference (atomic failure, confirmed
-  the referencing table never got installed), and a round-trip dump.
+  <table>`, `.dump <table> "<path>"`, `.parse <sql>`, `.quit`/`.exit`.
+  **M1 is done**: verified end to end with multi-table loads, a valid
+  foreign key reference, a rejected foreign key reference (atomic
+  failure, confirmed the referencing table never got installed), and a
+  round-trip dump. **M3 is done**: `.parse` verified against precedence
+  (`AND` binding tighter than `OR`), parenthesized/`NOT` subexpressions,
+  `''`-escaped string literals, `ORDER BY ... DESC`/`LIMIT`, and four
+  distinct malformed-input cases (each latching exactly one error at the
+  right line).
 
-Nothing here does SQL, transactions, or concurrency yet — that's the entire
-subject of the rest of this plan.
+Nothing here does transactions or concurrency yet, and nothing runs a
+parsed query against a table yet (M4) — that's the remaining subject of
+this plan.
 
 ### Stale scaffolding notes
 
@@ -214,19 +220,49 @@ connection handle — that ownership (plus arenas and, later, transaction
 state) is still ahead of us, whenever M5/M8 actually need it; no
 `db4*`-shaped object exists yet and none was added prematurely here.
 
-### M3 — SQL front end: lexer + parser -> AST
+### M3 — SQL front end: lexer + parser -> AST — **done**
 
-Hand-written lexer (tokens: keywords, identifiers, literals, operators,
-punctuation) and a recursive-descent parser, producing an AST. Start with
-just enough grammar to express M1/M2's capabilities as SQL:
+[lexer.h](../c/include/lexer.h) / `lexer.c` — hand-written tokenizer
+(keywords matched case-insensitively, identifiers, `INT`/`FLOAT`/`STRING`
+literals with SQL-style `''`-escaped strings, `--` line comments, the
+comparison/punctuation set the grammar below needs). Malformed input
+becomes a `TOK_ERROR` token rather than the lexer latching its own failure
+- the parser is the actual error boundary, so there's only one latch to
+check, not two.
+
+[ast.h](../c/include/ast.h) — node types for a `SelectStmt` (column list or
+`*`, table name, optional `WHERE` expression tree, optional single-column
+`ORDER BY` with `ASC`/`DESC`, optional `LIMIT`) and `Expr` (columns;
+`INT`/`DOUBLE`/`STRING`/`BOOL`/`NULL` literals; `NOT`; binary `=` `!=` `<`
+`<=` `>` `>=` `AND` `OR`). Everything in the tree is allocated into one
+`Arena` passed in by the caller - the whole parse is a single "throw it
+away as a unit" lifetime, same shape as `csv.c`'s row arena.
+
+[parser.h](../c/include/parser.h) / `parser.c` — recursive-descent parser
+producing that AST from:
 
 ```sql
-SELECT <cols> FROM <table> [WHERE <expr>] [ORDER BY <col>] [LIMIT <n>];
+SELECT <cols> FROM <table> [WHERE <expr>] [ORDER BY <col> [ASC|DESC]] [LIMIT <n>] [;]
 ```
 
-Parse errors should latch like `ArenaFailure` does: one error recorded at
-first failure, surfaced at the caller boundary, not threaded through every
-grammar production.
+`WHERE`'s expression grammar is `or_expr := and_expr (OR and_expr)*`,
+`and_expr := not_expr (AND not_expr)*`, `not_expr := NOT not_expr |
+comparison`, `comparison := primary (cmp_op primary)?`, `primary :=
+column | literal | '(' expr ')'` - enough to express real filters
+(`WHERE a >= 1 AND (b = 2 OR NOT c != 'x')`) without any arithmetic, since
+nothing here needs it yet.
+
+Errors latch exactly like `ArenaFailure`: `Parser` holds a sticky
+`failed`/`err`/`err_line`, `parser_fail()` only records the *first*
+failure, and every parse function checks `p->failed` on entry - one error
+surfaces at the caller boundary (`parser_parse_select` returns `NULL`,
+`parser_error()`/`parser_error_line()` report it) instead of a status
+code threaded through every grammar production.
+
+M3 has no executor to run against yet (M4), so `main.c` grew a `.parse
+<sql>` REPL command that lexes, parses, and pretty-prints the AST (or the
+latched error) - proof the grammar works standalone, without M4 needing to
+exist first.
 
 ### M4 — Execution engine: tree-walking interpreter over cursors
 
@@ -301,9 +337,9 @@ concurrent *writers*, not just concurrent readers.
 | `table.c`/`table.h`, `index.c`/`index.h` | column/row store + PK hash index (done — ported from db3) | M1 |
 | `schema.c`/`schema.h`, `load.c`/`load.h` | JSON schema overrides, CSV loader/dumper (done — ported/adapted from db3) | M1 |
 | `catalog.c`/`catalog.h` | name -> `Table*` registry (done — renamed/trimmed from `session.c`); connection object still to come | M2 |
-| `lexer.c`/`lexer.h` | SQL tokenizer | M3 |
-| `parser.c`/`parser.h` | recursive-descent parser -> AST | M3 |
-| `ast.h` | AST node types | M3 |
+| `lexer.c`/`lexer.h` | SQL tokenizer (done) | M3 |
+| `parser.c`/`parser.h` | recursive-descent parser -> AST (done) | M3 |
+| `ast.h` | AST node types (done) | M3 |
 | `cursor.c`/`cursor.h` | row iteration over a `Table` | M4 |
 | `interp.c`/`interp.h` | tree-walking query executor | M4 |
 | `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping | M5 |

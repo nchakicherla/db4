@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "arena.h"
 #include "linenoise.h"
 #include "load.h"
 #include "catalog.h"
+#include "parser.h"
 #include "table.h"
 
 static const char *skip_spaces(const char *s) {
@@ -75,6 +77,26 @@ static void cmd_schema(Catalog *catalog, const char *args) {
     print_schema(&catalog->tables[idx].table);
 }
 
+/* Lexes and parses a SELECT statement and prints the resulting AST -
+ * there's no executor yet (M4), so this is M3's own way of standing on
+ * its own: proof the grammar works without waiting for execution. */
+static void cmd_parse(const char *args) {
+    Arena arena;
+    arena_init(&arena);
+
+    Parser parser;
+    parser_init(&parser, args, strlen(args), &arena);
+
+    SelectStmt *stmt = parser_parse_select(&parser);
+    if (parser_failed(&parser)) {
+        printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
+    } else {
+        select_stmt_print(stdout, stmt);
+    }
+
+    arena_term(&arena);
+}
+
 static void dispatch(Catalog *catalog, const char *line) {
     if (strncmp(line, ".load ", 6) == 0) {
         load_csv(catalog, line + 6);
@@ -84,6 +106,8 @@ static void dispatch(Catalog *catalog, const char *line) {
         cmd_schema(catalog, line + 8);
     } else if (strncmp(line, ".dump ", 6) == 0) {
         cmd_dump(catalog, line + 6);
+    } else if (strncmp(line, ".parse ", 7) == 0) {
+        cmd_parse(line + 7);
     } else {
         printf("unknown command: %s\n", line);
     }

@@ -75,7 +75,7 @@ static size_t load_row(Table *t, const CsvRow *row) {
     return table_failed(t) ? SIZE_MAX : r;
 }
 
-static bool fk_chain_reaches(const Session *session, const Table *ref_table, const char *target, size_t depth_left) {
+static bool fk_chain_reaches(const Catalog *catalog, const Table *ref_table, const char *target, size_t depth_left) {
     if (depth_left == 0) return true;
 
     for (size_t col = 0; col < ref_table->n_cols; col++) {
@@ -83,9 +83,9 @@ static bool fk_chain_reaches(const Session *session, const Table *ref_table, con
         if (!table_get_foreign_key(ref_table, col, &fk_table, &fk_column)) continue;
         if (strcmp(fk_table, target) == 0) return true;
 
-        int idx = session_find(session, fk_table);
+        int idx = catalog_find(catalog, fk_table);
         if (idx < 0) continue;
-        if (fk_chain_reaches(session, &session->tables[idx].table, target, depth_left - 1)) return true;
+        if (fk_chain_reaches(catalog, &catalog->tables[idx].table, target, depth_left - 1)) return true;
     }
     return false;
 }
@@ -156,7 +156,7 @@ static bool read_file(const char *path, size_t reserve, char **out_data, size_t 
     return true;
 }
 
-void load_csv(Session *session, const char *args) {
+void load_csv(Catalog *catalog, const char *args) {
     char name[64];
     int  name_consumed = 0;
     if (sscanf(args, "%63s%n", name, &name_consumed) != 1) {
@@ -281,14 +281,14 @@ void load_csv(Session *session, const char *args) {
             goto fail;
         }
 
-        int ref_table_idx = session_find(session, overrides.fk_tables[i]);
+        int ref_table_idx = catalog_find(catalog, overrides.fk_tables[i]);
         if (ref_table_idx < 0) {
             printf("unknown table \"%s\" referenced by column \"%s\"\n", overrides.fk_tables[i], overrides.names[i]);
             goto fail;
         }
-        Table *ref_table = &session->tables[ref_table_idx].table;
+        Table *ref_table = &catalog->tables[ref_table_idx].table;
 
-        if (fk_chain_reaches(session, ref_table, name, session->count)) {
+        if (fk_chain_reaches(catalog, ref_table, name, catalog->count)) {
             printf("column \"%s\" cannot reference \"%s\" (it already references \"%s\", directly or "
                    "indirectly - this would create a cycle)\n",
                    overrides.names[i], overrides.fk_tables[i], name);
@@ -351,8 +351,8 @@ void load_csv(Session *session, const char *args) {
         table_set_foreign_key(&new_table, (size_t)col, overrides.fk_tables[i], overrides.fk_columns[i],
                               overrides.fk_on_delete[i], overrides.fk_on_update[i]);
 
-        int ref_table_idx = session_find(session, overrides.fk_tables[i]);
-        fk_ref_table[col] = &session->tables[ref_table_idx].table;
+        int ref_table_idx = catalog_find(catalog, overrides.fk_tables[i]);
+        fk_ref_table[col] = &catalog->tables[ref_table_idx].table;
         fk_ref_col[col]   = table_find_column(fk_ref_table[col], overrides.fk_columns[i]);
     }
     if (pk_override_idx >= 0) {
@@ -382,7 +382,7 @@ void load_csv(Session *session, const char *args) {
         n_loaded++;
     }
 
-    Table *slot = session_put(session, name);
+    Table *slot = catalog_put(catalog, name);
     if (!slot) goto oom;
     *slot = new_table;
 
@@ -483,16 +483,16 @@ bool dump_csv(const Table *t, const char *path) {
     return true;
 }
 
-void print_tables(const Session *session) {
-    if (session->count == 0) {
+void print_tables(const Catalog *catalog) {
+    if (catalog->count == 0) {
         printf("no tables loaded\n");
         return;
     }
 
-    for (size_t i = 0; i < session->count; i++) {
-        const Table *t = &session->tables[i].table;
+    for (size_t i = 0; i < catalog->count; i++) {
+        const Table *t = &catalog->tables[i].table;
         printf("%s (%zu cols, %zu rows)\n",
-               session->tables[i].name, t->n_cols, t->n_rows - t->n_dead);
+               catalog->tables[i].name, t->n_cols, t->n_rows - t->n_dead);
     }
 }
 

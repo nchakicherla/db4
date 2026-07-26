@@ -3,7 +3,7 @@
 
 #include "linenoise.h"
 #include "load.h"
-#include "session.h"
+#include "catalog.h"
 #include "table.h"
 
 static const char *skip_spaces(const char *s) {
@@ -24,7 +24,7 @@ static bool take_word(const char **pp, char *buf, size_t buf_len) {
     return true;
 }
 
-static void cmd_dump(Session *session, const char *args) {
+static void cmd_dump(Catalog *catalog, const char *args) {
     char name[MAX_COL_NAME_LEN], path[512];
     const char *p = args;
     if (!take_word(&p, name, sizeof name)) {
@@ -48,17 +48,17 @@ static void cmd_dump(Session *session, const char *args) {
     }
     path[n] = '\0';
 
-    int idx = session_find(session, name);
+    int idx = catalog_find(catalog, name);
     if (idx < 0) {
         printf("no such table: %s\n", name);
         return;
     }
 
-    if (dump_csv(&session->tables[idx].table, path))
+    if (dump_csv(&catalog->tables[idx].table, path))
         printf("dumped %s to %s\n", name, path);
 }
 
-static void cmd_schema(Session *session, const char *args) {
+static void cmd_schema(Catalog *catalog, const char *args) {
     char name[MAX_COL_NAME_LEN];
     const char *p = args;
     if (!take_word(&p, name, sizeof name)) {
@@ -66,24 +66,24 @@ static void cmd_schema(Session *session, const char *args) {
         return;
     }
 
-    int idx = session_find(session, name);
+    int idx = catalog_find(catalog, name);
     if (idx < 0) {
         printf("no such table: %s\n", name);
         return;
     }
 
-    print_schema(&session->tables[idx].table);
+    print_schema(&catalog->tables[idx].table);
 }
 
-static void dispatch(Session *session, const char *line) {
+static void dispatch(Catalog *catalog, const char *line) {
     if (strncmp(line, ".load ", 6) == 0) {
-        load_csv(session, line + 6);
+        load_csv(catalog, line + 6);
     } else if (strcmp(line, ".tables") == 0) {
-        print_tables(session);
+        print_tables(catalog);
     } else if (strncmp(line, ".schema ", 8) == 0) {
-        cmd_schema(session, line + 8);
+        cmd_schema(catalog, line + 8);
     } else if (strncmp(line, ".dump ", 6) == 0) {
-        cmd_dump(session, line + 6);
+        cmd_dump(catalog, line + 6);
     } else {
         printf("unknown command: %s\n", line);
     }
@@ -92,7 +92,7 @@ static void dispatch(Session *session, const char *line) {
 int main(void) {
     linenoiseHistorySetMaxLen(100);
 
-    Session session = {0};
+    Catalog catalog = {0};
 
     char *line;
     while ((line = linenoise("db4> ")) != NULL) {
@@ -109,13 +109,13 @@ int main(void) {
         }
 
         if (line[0] == '.') {
-            dispatch(&session, line);
+            dispatch(&catalog, line);
         } else {
             printf("%s\n", line);
         }
         linenoiseFree(line);
     }
 
-    session_term(&session);
+    catalog_term(&catalog);
     return 0;
 }

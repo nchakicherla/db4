@@ -56,11 +56,15 @@ prototype:
   (`table_set_foreign_key`) — more than a minimal row store strictly needs,
   brought in because it's proven, tested code rather than something to
   re-derive later.
-- [session.h](../c/include/session.h) / `session.c` — a `Session`: an
-  array of named `Table`s (`.load`/`.tables` need more than one table
-  addressable at once). Ported as-is from db3; this is the same job M2's
-  `catalog.c` is planned to formalize into a connection-scoped registry —
-  for now `Session` *is* the catalog, informally.
+- [catalog.h](../c/include/catalog.h) / `catalog.c` — **M2's catalog**: a
+  `Catalog` is an array of named `Table`s (`.load`/`.tables` need more than
+  one table addressable at once), name -> `Table*` lookup via
+  `catalog_find`/`catalog_put`. This is `session.c` renamed and trimmed per
+  the plan's own suggestion (module map, M2) rather than a new file: the
+  `current`/`session_current`/`session_current_name` fields and accessors
+  were dropped as dead code (nothing outside `session.c` itself ever called
+  them). No connection-owned arenas or txn state yet — that's still ahead,
+  whenever M5/M8 need it.
 - [schema.h](../c/include/schema.h) / `schema.c` — parses `.load`'s optional
   JSON schema-override argument (`{"col":"type", "id":{"type":"int",
   "primary":true, "references":"other.col", ...}}`) into a `SchemaOverride`,
@@ -70,7 +74,7 @@ prototype:
   [{schema}|"<schema.json>"]`, infers each column's `FieldType` from the
   first data row (or takes a schema override), streams the rest through
   `csv_reader_next_row` into a scratch `Table`, and only installs it into
-  the `Session` once every row has passed primary-key/foreign-key
+  the `Catalog` once every row has passed primary-key/foreign-key
   validation — a malformed or constraint-violating load is rejected
   atomically, the scratch table is simply discarded. Also has `dump_csv`
   (new code, not ported — db3 never had a CSV-dump command) and the
@@ -196,17 +200,19 @@ no milestone should require the next one to already exist to be worth having.
 ### M1 — Table: an in-memory row store over CSV — **done**
 
 See "Where things stand" above for the full breakdown of what's in the
-tree (`table.c`/`index.c`, `session.c`, `schema.c`, `load.c`) and what was
+tree (`table.c`/`index.c`, `catalog.c`, `schema.c`, `load.c`) and what was
 deliberately left out (UPDATE/DELETE cascades, tests). `main.c`'s REPL
 supports `.load <name> "<path>" [schema]`, `.tables`, `.schema <table>`,
 and `.dump <table> "<path>"`.
 
-### M2 — Catalog
+### M2 — Catalog — **done**
 
-A registry of open tables (name -> `Table*`) scoped to a `db4` connection
-handle. This is also where the public API's connection object (`db4*`)
-starts to take shape, even before M8 makes it public: something owns the
-catalog, the arenas, and (later) the transaction state.
+A registry of open tables (name -> `Table*`), formalized from M1's `Session`
+into [catalog.h](../c/include/catalog.h) / `catalog.c`'s `Catalog` (see
+"Where things stand" above). Still a plain struct, not yet owned by a
+connection handle — that ownership (plus arenas and, later, transaction
+state) is still ahead of us, whenever M5/M8 actually need it; no
+`db4*`-shaped object exists yet and none was added prematurely here.
 
 ### M3 — SQL front end: lexer + parser -> AST
 
@@ -293,8 +299,8 @@ concurrent *writers*, not just concurrent readers.
 | File | Purpose | Milestone |
 |---|---|---|
 | `table.c`/`table.h`, `index.c`/`index.h` | column/row store + PK hash index (done — ported from db3) | M1 |
-| `session.c`/`session.h`, `schema.c`/`schema.h`, `load.c`/`load.h` | named-table registry, JSON schema overrides, CSV loader/dumper (done — ported/adapted from db3) | M1 |
-| `catalog.c`/`catalog.h` | name -> `Table*` registry, connection state — may just be `session.c` renamed/extended rather than a new file | M2 |
+| `schema.c`/`schema.h`, `load.c`/`load.h` | JSON schema overrides, CSV loader/dumper (done — ported/adapted from db3) | M1 |
+| `catalog.c`/`catalog.h` | name -> `Table*` registry (done — renamed/trimmed from `session.c`); connection object still to come | M2 |
 | `lexer.c`/`lexer.h` | SQL tokenizer | M3 |
 | `parser.c`/`parser.h` | recursive-descent parser -> AST | M3 |
 | `ast.h` | AST node types | M3 |

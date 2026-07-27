@@ -513,13 +513,69 @@ def test_pk_index_lookup():
                       f"the stale id=2 index entry must not resurrect the old row, found {o.count('Bob')}")])
 
 
+# ---------------------------------------------------------------------------
+# Index-accelerated joins: exec_select_plain's join loop probes the inner
+# table's pk_index once per outer row (via find_join_pk_equality) instead
+# of a full nested-loop scan, when the ON clause has a top-level
+# "<inner>.<pk> = <expr>" conjunct. The M6 join test above never exercises
+# this - it loads customers without a PK schema override, and joins the
+# other direction (customers first, orders - which has no PK at all -
+# second), so pk_col stays -1 either way. These load customers WITH a PK
+# and join orders -> customers specifically so customers lands as the
+# *inner* (second, PK-bearing) table.
+# ---------------------------------------------------------------------------
+
+def test_join_index_lookup():
+    d = fresh_tmp("join_index_basic")
+    check("Join index: orders -> customers on customers' PK returns the right names", d,
+          [LOAD_CUSTOMERS_PK, '.load orders "orders.csv"',
+           "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id ORDER BY orders.id",
+           '.quit'],
+          [lambda o: (o.count("Alice") == 2, f"orders 1 and 3 both belong to Alice, found {o.count('Alice')}"),
+           lambda o: (o.count("Bob") == 1, f"order 2 belongs to Bob, found {o.count('Bob')}"),
+           "(3 rows)"])
+
+    d = fresh_tmp("join_index_reversed")
+    check("Join index: reversed operand order (customers.id = orders.customer_id)", d,
+          [LOAD_CUSTOMERS_PK, '.load orders "orders.csv"',
+           "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON customers.id = orders.customer_id ORDER BY orders.id",
+           '.quit'],
+          [lambda o: (o.count("Alice") == 2, "expected Alice twice"), "(3 rows)"])
+
+    d = fresh_tmp("join_index_and_conjunct")
+    check("Join index: AND-conjunct alongside the PK equality still applies the whole ON clause", d,
+          [LOAD_CUSTOMERS_PK, '.load orders "orders.csv"',
+           "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id AND customers.age > 26 ORDER BY orders.id",
+           '.quit'],
+          [not_("Bob"), lambda o: (o.count("Alice") == 2, "Bob (age 25) should be excluded by the AND, Alice's two orders kept"), "(2 rows)"])
+
+    d = fresh_tmp("join_index_with_where")
+    check("Join index: coexists correctly with a separate WHERE filter", d,
+          [LOAD_CUSTOMERS_PK, '.load orders "orders.csv"',
+           "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id WHERE orders.qty > 1 ORDER BY orders.id",
+           '.quit'],
+          [not_("Bob"), "(2 rows)"])  # order 2 (qty=1, Bob) filtered by WHERE, orders 1 and 3 (qty 3, 2) kept
+
+    d = fresh_tmp("join_index_stale_update")
+    check("Join index: stale PK index entry after UPDATE doesn't phantom-match an old join partner", d,
+          [LOAD_CUSTOMERS_PK, '.load orders "orders.csv"',
+           "UPDATE customers SET id = 99 WHERE id = 2",
+           "SELECT orders.id, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id ORDER BY orders.id",
+           '.quit'],
+          ["1 row updated",
+           not_("Bob"),  # order 2 still points at customer_id=2, which no longer exists - inner join drops it
+           lambda o: (o.count("Alice") == 2, "Alice's two orders should be unaffected"),
+           "(2 rows)"])  # only orders 1 and 3 (Alice) now match - order 2's join partner is gone
+
+
 def main():
     if not os.path.exists(BIN):
         print(f"binary not found at {BIN}; run `make` first", file=sys.stderr)
         sys.exit(2)
     os.makedirs(TMP, exist_ok=True)
 
-    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8, test_pk_index_lookup]:
+    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8,
+               test_pk_index_lookup, test_join_index_lookup]:
         try:
             fn()
         except AssertionError as e:

@@ -492,6 +492,39 @@ static bool find_pk_equality(const Expr *e, const RowCtx *ctx, const char *pk_na
     return true;
 }
 
+/* JOIN's analogue of find_pk_equality above: recognizes a top-level
+ * "<inner_alias>.<pk_col> = <expr>" or "<expr> = <inner_alias>.<pk_col>"
+ * conjunct in a JOIN's ON clause. Unlike a WHERE conjunct's <const>,
+ * <expr> here is only a per-outer-row constant (it can reference the
+ * already-built left side's columns), so this just returns the
+ * recognized Expr* for the caller to evaluate once per outer row - it
+ * does not itself check that <expr> is actually safe to evaluate before
+ * the inner table is touched (no reference back into it, qualified or
+ * not); that's the caller's job via infer_expr_type against an
+ * outer-sources-only RowCtx, reusing the exact same resolution the rest
+ * of this file already trusts rather than re-deriving column-ambiguity
+ * rules here.
+ *
+ * The inner side must be explicitly qualified with inner_alias - an
+ * unqualified reference just means this join step doesn't get the fast
+ * path (falls back to the existing nested-loop scan, still fully
+ * correct), not that anything is wrong; it's a deliberately conservative
+ * scope limit, not a correctness compromise. */
+static const Expr *find_join_pk_equality(const Expr *e, const char *inner_alias, const char *pk_name) {
+    if (e->kind == EXPR_BINARY && e->as.binary.op == OP_AND) {
+        const Expr *l = find_join_pk_equality(e->as.binary.left, inner_alias, pk_name);
+        return l ? l : find_join_pk_equality(e->as.binary.right, inner_alias, pk_name);
+    }
+    if (e->kind != EXPR_BINARY || e->as.binary.op != OP_EQ) return NULL;
+
+    const Expr *l = e->as.binary.left, *r = e->as.binary.right;
+    if (l->kind == EXPR_COLUMN && l->as.column.table && strcmp(l->as.column.table, inner_alias) == 0
+        && strcmp(l->as.column.name, pk_name) == 0) return r;
+    if (r->kind == EXPR_COLUMN && r->as.column.table && strcmp(r->as.column.table, inner_alias) == 0
+        && strcmp(r->as.column.name, pk_name) == 0) return l;
+    return NULL;
+}
+
 typedef struct {
     size_t *rows;
     size_t  count, cap;
@@ -694,13 +727,87 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
         size_t *next = NULL;
         size_t  next_count = 0, next_cap = 0;
 
+        /* Index-accelerated join: if this step's ON clause has a top-level
+         * "<inner>.<pk> = <expr>" conjunct where <expr> only touches the
+         * already-built left side, probe the inner table's PK index once
+         * per outer row instead of scanning every one of its rows -
+         * O(outer + inner) instead of O(outer * inner). Eligibility is
+         * decided once per join step (not per row), and the ON clause is
+         * still fully re-evaluated per candidate below exactly as the
+         * nested-loop fallback does, for the same reason find_pk_equality
+         * documents for WHERE: the index only narrows candidates, so a
+         * hash collision or stale entry can only cost a wasted check,
+         * never a wrong result. */
+        const Expr *outer_key_expr = NULL;
+        if (tables[filled]->pk_col >= 0 && row_index_usable(&tables[filled]->pk_index)) {
+            outer_key_expr = find_join_pk_equality(stmt->joins[j].on, names[filled], tables[filled]->names[tables[filled]->pk_col]);
+            if (outer_key_expr) {
+                RowSource outer_sources[MAX_JOIN_SOURCES];
+                for (size_t s = 0; s < filled; s++) outer_sources[s] = (RowSource){ names[s], tables[s], 0 };
+                RowCtx      outer_only_ctx = { outer_sources, filled, params, n_params };
+                ExprValueType discard_ty;
+                char           discard_err[64];
+                if (!infer_expr_type(outer_key_expr, &outer_only_ctx, &discard_ty, discard_err, sizeof discard_err))
+                    outer_key_expr = NULL; /* references the inner table (or something else) - no fast path */
+            }
+        }
+
         for (size_t i = 0; i < cur_count; i++) {
+            RowSource probe[MAX_JOIN_SOURCES];
+            for (size_t s = 0; s < filled; s++) probe[s] = (RowSource){ names[s], tables[s], cur[i * width + s] };
+
+            if (outer_key_expr) {
+                RowCtx outer_ctx = { probe, filled, params, n_params };
+                Value  key       = eval_value(outer_key_expr, &outer_ctx);
+                if (key.is_null) continue; /* NULL never equals anything - no candidates */
+
+                PkLookupRows collected = {0};
+                row_index_find(&tables[filled]->pk_index, value_hash(key), &collected, collect_pk_row);
+                if (collected.oom) {
+                    snprintf(err, err_len, "out of memory");
+                    free(collected.rows);
+                    free(next);
+                    free(cur);
+                    free(proj_src);
+                    free(proj_col);
+                    return false;
+                }
+
+                for (size_t k = 0; k < collected.count; k++) {
+                    size_t jrow = collected.rows[k];
+                    if (table_row_is_dead(tables[filled], jrow)) continue;
+
+                    probe[filled] = (RowSource){ names[filled], tables[filled], jrow };
+                    RowCtx probe_ctx = { probe, filled + 1, params, n_params };
+                    if (eval_tri(stmt->joins[j].on, &probe_ctx) != TRI_TRUE) continue;
+
+                    if (next_count == next_cap) {
+                        size_t new_cap = next_cap ? next_cap * 2 : 16;
+                        size_t *grown = realloc(next, new_cap * width * sizeof(size_t));
+                        if (!grown) {
+                            snprintf(err, err_len, "out of memory");
+                            free(collected.rows);
+                            free(next);
+                            free(cur);
+                            free(proj_src);
+                            free(proj_col);
+                            return false;
+                        }
+                        next     = grown;
+                        next_cap = new_cap;
+                    }
+                    for (size_t s = 0; s < filled; s++) next[next_count * width + s] = cur[i * width + s];
+                    next[next_count * width + filled] = jrow;
+                    next_count++;
+                }
+                free(collected.rows);
+                continue;
+            }
+
             Cursor cj;
             cursor_init(&cj, tables[filled]);
             size_t jrow;
             while (cursor_next(&cj, &jrow)) {
-                RowSource probe[MAX_JOIN_SOURCES];
-                for (size_t s = 0; s < filled; s++) probe[s] = (RowSource){ names[s], tables[s], cur[i * width + s] };
                 probe[filled] = (RowSource){ names[filled], tables[filled], jrow };
                 RowCtx probe_ctx = { probe, filled + 1, params, n_params };
 

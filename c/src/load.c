@@ -159,12 +159,12 @@ static bool read_file(const char *path, size_t reserve, char **out_data, size_t 
     return true;
 }
 
-void load_csv(Catalog *catalog, const char *args) {
+bool load_csv(Catalog *catalog, const char *args) {
     char name[64];
     int  name_consumed = 0;
     if (sscanf(args, "%63s%n", name, &name_consumed) != 1) {
         usage_load();
-        return;
+        return false;
     }
     args += name_consumed;
     while (*args == ' ') args++;
@@ -172,7 +172,7 @@ void load_csv(Catalog *catalog, const char *args) {
     char path[4096];
     if (*args != '"' || !read_quoted(&args, path, sizeof path)) {
         usage_load();
-        return;
+        return false;
     }
 
     const char *inline_schema = NULL;
@@ -185,12 +185,12 @@ void load_csv(Catalog *catalog, const char *args) {
     } else if (*args == '"') {
         if (!read_quoted(&args, schema_path, sizeof schema_path)) {
             usage_load();
-            return;
+            return false;
         }
-        if (!read_file(schema_path, 0, &schema_file_data, &schema_file_len)) return;
+        if (!read_file(schema_path, 0, &schema_file_data, &schema_file_len)) return false;
     } else if (*args != '\0') {
         usage_load();
-        return;
+        return false;
     }
 
     char     *data         = NULL;
@@ -208,7 +208,7 @@ void load_csv(Catalog *catalog, const char *args) {
         if (have_lock) db4_lock_release(&lock);
         db4_lock_close(&lock);
         free(schema_file_data);
-        return;
+        return false;
     }
     budget_charge(n_read);
     data_charged = n_read;
@@ -415,7 +415,7 @@ void load_csv(Catalog *catalog, const char *args) {
     free(data);
     if (have_lock) db4_lock_release(&lock);
     db4_lock_close(&lock);
-    return;
+    return true;
 
 oom:
     {
@@ -434,6 +434,7 @@ fail:
     free(data);
     if (have_lock) db4_lock_release(&lock);
     db4_lock_close(&lock);
+    return false;
 }
 
 static bool csv_field_needs_quotes(const char *s, size_t len) {

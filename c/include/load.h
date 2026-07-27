@@ -8,7 +8,7 @@
 
 #define MAX_COL_NAME_LEN 64
 
-void load_csv(Catalog *catalog, const char *args);
+bool load_csv(Catalog *catalog, const char *args);
 
 bool dump_csv(const Table *t, const char *path);
 

@@ -43,16 +43,8 @@ def run(workdir, lines, timeout=5):
     return p.stdout
 
 
-def check(name, workdir, lines, checks):
+def _evaluate_checks(out, checks):
     """checks: list of (predicate_fn, description) OR plain strings (substring must appear)."""
-    global passed, failed
-    try:
-        out = run(workdir, lines)
-    except Exception as e:
-        failed += 1
-        fails.append((name, f"EXCEPTION: {e}"))
-        print(f"FAIL {name}: exception {e}")
-        return
     problems = []
     for c in checks:
         if isinstance(c, str):
@@ -65,6 +57,11 @@ def check(name, workdir, lines, checks):
             ok, desc = c(out)
             if not ok:
                 problems.append(desc)
+    return problems
+
+
+def _report(name, problems, out):
+    global passed, failed
     if problems:
         failed += 1
         fails.append((name, problems, out))
@@ -74,6 +71,40 @@ def check(name, workdir, lines, checks):
     else:
         passed += 1
         print(f"PASS {name}")
+
+
+def check(name, workdir, lines, checks):
+    try:
+        out = run(workdir, lines)
+    except Exception as e:
+        global failed
+        failed += 1
+        fails.append((name, f"EXCEPTION: {e}"))
+        print(f"FAIL {name}: exception {e}")
+        return
+    _report(name, _evaluate_checks(out, checks), out)
+
+
+def check_batch(name, workdir, script_filename, script_contents, checks, expect_returncode=None):
+    """Like check(), but writes script_contents to workdir/script_filename and runs
+    `bin/main <script_filename>` (the CLI positional-argument batch mode) against it,
+    instead of piping lines to stdin - and can also assert the process's exit code,
+    which plain check()/run() never look at."""
+    global failed
+    with open(os.path.join(workdir, script_filename), "w") as f:
+        f.write(script_contents)
+    try:
+        p = subprocess.run([os.path.abspath(BIN), script_filename], cwd=workdir,
+                            capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        failed += 1
+        fails.append((name, f"EXCEPTION: {e}"))
+        print(f"FAIL {name}: exception {e}")
+        return
+    problems = _evaluate_checks(p.stdout, checks)
+    if expect_returncode is not None and p.returncode != expect_returncode:
+        problems.append(f"expected exit code {expect_returncode}, got {p.returncode}")
+    _report(name, problems, p.stdout)
 
 
 def not_(s):
@@ -568,6 +599,68 @@ def test_join_index_lookup():
            "(2 rows)"])  # only orders 1 and 3 (Alice) now match - order 2's join partner is gone
 
 
+# ---------------------------------------------------------------------------
+# Batch mode: `bin/main <script>` runs a file's lines the same way piped
+# stdin already did, but stops at the first failure and exits non-zero -
+# the actual point being that this is now scriptable/CI-able, not just
+# interactive. `.read` is the same execution path reached from inside an
+# existing session instead of the command line, including a `.quit` deep
+# inside a `.read`'d file correctly exiting the whole process, not just
+# that one file.
+# ---------------------------------------------------------------------------
+
+def test_batch_mode():
+    d = fresh_tmp("batch_success")
+    check_batch("Batch: a script argument runs to EOF with no explicit .quit needed", d,
+                "script.sql",
+                'CREATE TABLE t (id INT PRIMARY KEY, name TEXT)\n'
+                "INSERT INTO t VALUES (1, 'ada'), (2, 'grace')\n"
+                "SELECT * FROM t ORDER BY id\n",
+                ["table \"t\" created", "2 rows inserted", "ada", "grace", "(2 rows)"],
+                expect_returncode=0)
+
+    d = fresh_tmp("batch_stops_on_error")
+    check_batch("Batch: stops at the first failure and does not run what follows it", d,
+                "script.sql",
+                "CREATE TABLE t (id INT PRIMARY KEY)\n"
+                "SELECT * FROM nonexistent_table\n"
+                "INSERT INTO t VALUES (99)\n"
+                "SELECT * FROM t\n",
+                ["no such table", not_("1 row inserted"), not_("99")],
+                expect_returncode=1)
+
+    d = fresh_tmp("batch_missing_file")
+    p = subprocess.run([os.path.abspath(BIN), "does_not_exist.sql"], cwd=d,
+                        capture_output=True, text=True, timeout=5)
+    _report("Batch: a nonexistent script file exits non-zero with a clear error, not a hang",
+            _evaluate_checks(p.stderr, ["does_not_exist.sql"]) +
+            ([] if p.returncode == 1 else [f"expected exit code 1, got {p.returncode}"]),
+            p.stderr)
+
+    d = fresh_tmp("batch_too_many_args")
+    p = subprocess.run([os.path.abspath(BIN), "a.sql", "b.sql"], cwd=d,
+                        capture_output=True, text=True, timeout=5)
+    _report("Batch: more than one script argument is a usage error, not silently ignored",
+            _evaluate_checks(p.stderr, ["usage"]) +
+            ([] if p.returncode == 1 else [f"expected exit code 1, got {p.returncode}"]),
+            p.stderr)
+
+    d = fresh_tmp("read_command")
+    with open(os.path.join(d, "included.sql"), "w") as f:
+        f.write('CREATE TABLE t (id INT PRIMARY KEY, name TEXT)\n'
+                "INSERT INTO t VALUES (1, 'ada')\n")
+    check(".read runs another file's lines through the same session", d,
+          ['.read "included.sql"', "SELECT name FROM t WHERE id = 1", ".quit"],
+          ["table \"t\" created", "1 row inserted", "ada"])
+
+    d = fresh_tmp("read_quit_propagates")
+    with open(os.path.join(d, "quits.sql"), "w") as f:
+        f.write("CREATE TABLE t2 (id INT)\n.quit\nINSERT INTO t2 VALUES (1)\n")
+    check(".quit inside a .read'd file exits the whole session, not just that file", d,
+          ['.read "quits.sql"', "SELECT 999999", ".quit"],
+          ["table \"t2\" created", not_("1 row inserted"), not_("999999")])
+
+
 def main():
     if not os.path.exists(BIN):
         print(f"binary not found at {BIN}; run `make` first", file=sys.stderr)
@@ -575,7 +668,7 @@ def main():
     os.makedirs(TMP, exist_ok=True)
 
     for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8,
-               test_pk_index_lookup, test_join_index_lookup]:
+               test_pk_index_lookup, test_join_index_lookup, test_batch_mode]:
         try:
             fn()
         except AssertionError as e:

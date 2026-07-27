@@ -19,6 +19,16 @@
 #include "table.h"
 #include "wal.h"
 
+/* Every line-processing function below returns one of these instead of a
+ * plain bool, so a .quit/.exit reached inside a .read'd file (or a script
+ * passed on the command line - see main()) can unwind all the way back
+ * to main() and actually exit, not just stop that one nested file - the
+ * same behavior sqlite3's own CLI gives .quit wherever it's encountered. */
+typedef enum { LINE_OK, LINE_FAIL, LINE_QUIT } LineResult;
+
+static LineResult dispatch(Db4 *db, const char *line);
+static LineResult process_line(Db4 *db, const char *line);
+
 static const char *skip_spaces(const char *s) {
     while (*s == ' ') s++;
     return s;
@@ -54,43 +64,47 @@ static bool take_quoted(const char **pp, char *buf, size_t buf_len) {
     return true;
 }
 
-static void cmd_dump(Catalog *catalog, const char *args) {
+static bool cmd_dump(Catalog *catalog, const char *args) {
     char name[MAX_COL_NAME_LEN], path[512];
     const char *p = args;
     if (!take_word(&p, name, sizeof name) || !take_quoted(&p, path, sizeof path)) {
         printf("usage: .dump <table> \"<path>\"\n");
-        return;
+        return false;
     }
 
     int idx = catalog_find(catalog, name);
     if (idx < 0) {
         printf("no such table: %s\n", name);
-        return;
+        return false;
     }
 
-    if (dump_csv(&catalog->tables[idx].table, path))
-        printf("dumped %s to %s\n", name, path);
+    if (!dump_csv(&catalog->tables[idx].table, path)) {
+        printf("dump failed for %s\n", name);
+        return false;
+    }
+    printf("dumped %s to %s\n", name, path);
+    return true;
 }
 
 /* Folds a table's WAL back into its base CSV (M7) - a brief exclusive
  * lock (see lock.h) excludes concurrent readers' `.load` snapshots and
  * other writers' commits while the base file is rewritten. */
-static void cmd_checkpoint(Catalog *catalog, const char *args) {
+static bool cmd_checkpoint(Catalog *catalog, const char *args) {
     char name[MAX_COL_NAME_LEN];
     const char *p = args;
     if (!take_word(&p, name, sizeof name)) {
         printf("usage: .checkpoint <table>\n");
-        return;
+        return false;
     }
 
     int idx = catalog_find(catalog, name);
     if (idx < 0) {
         printf("no such table: %s\n", name);
-        return;
+        return false;
     }
     if (!catalog->tables[idx].path) {
         printf("table \"%s\" has no backing file to checkpoint\n", name);
-        return;
+        return false;
     }
 
     const char *path = catalog->tables[idx].path;
@@ -98,7 +112,7 @@ static void cmd_checkpoint(Catalog *catalog, const char *args) {
     int         n = snprintf(wal_path, sizeof wal_path, "%s.wal", path);
     if (n < 0 || (size_t)n >= sizeof wal_path) {
         printf("path too long: %s\n", path);
-        return;
+        return false;
     }
 
     Db4Lock lock;
@@ -112,23 +126,25 @@ static void cmd_checkpoint(Catalog *catalog, const char *args) {
 
     if (ok) printf("checkpointed %s\n", name);
     else printf("checkpoint failed for %s\n", name);
+    return ok;
 }
 
-static void cmd_schema(Catalog *catalog, const char *args) {
+static bool cmd_schema(Catalog *catalog, const char *args) {
     char name[MAX_COL_NAME_LEN];
     const char *p = args;
     if (!take_word(&p, name, sizeof name)) {
         printf("usage: .schema <table>\n");
-        return;
+        return false;
     }
 
     int idx = catalog_find(catalog, name);
     if (idx < 0) {
         printf("no such table: %s\n", name);
-        return;
+        return false;
     }
 
     print_schema(&catalog->tables[idx].table);
+    return true;
 }
 
 /* Basic filesystem navigation, so a REPL session can move around to
@@ -138,21 +154,22 @@ static void cmd_schema(Catalog *catalog, const char *args) {
  * path can contain a space and because it lets tab completion's existing
  * quoted-path handling (complete_filename, below) cover these commands
  * for free instead of needing a second completion scheme. */
-static void cmd_cd(const char *args) {
+static bool cmd_cd(const char *args) {
     char path[1024];
     const char *p = args;
     if (!take_quoted(&p, path, sizeof path)) {
         printf("usage: .cd \"<path>\"\n");
-        return;
+        return false;
     }
 
     if (chdir(path) != 0) {
         printf("cd: %s: %s\n", path, strerror(errno));
-        return;
+        return false;
     }
 
     char cwd[1024];
     if (getcwd(cwd, sizeof cwd)) printf("%s\n", cwd);
+    return true;
 }
 
 /* Lists a directory's entries, alphabetically (scandir's own job, not
@@ -169,20 +186,21 @@ static int name_cmp(const void *a, const void *b) {
  * -D_GNU_SOURCE build rule in the makefile; not worth another one just
  * for this). opendir/readdir are the same portable POSIX.1 pair
  * complete_filename below already relies on. */
-static void cmd_ls(const char *args) {
+static bool cmd_ls(const char *args) {
     char path[1024] = ".";
     const char *p   = args;
     if (*skip_spaces(p) != '\0' && !take_quoted(&p, path, sizeof path)) {
         printf("usage: .ls [\"<path>\"]\n");
-        return;
+        return false;
     }
 
     DIR *dp = opendir(path);
     if (!dp) {
         printf("ls: %s: %s\n", path, strerror(errno));
-        return;
+        return false;
     }
 
+    bool    oom  = false;
     char  **names = NULL;
     size_t  n = 0, cap = 0;
     struct dirent *ent;
@@ -191,7 +209,7 @@ static void cmd_ls(const char *args) {
         if (n == cap) {
             size_t  new_cap = cap ? cap * 2 : 16;
             char  **grown   = realloc(names, new_cap * sizeof(char *));
-            if (!grown) { printf("out of memory\n"); break; }
+            if (!grown) { printf("out of memory\n"); oom = true; break; }
             names = grown;
             cap   = new_cap;
         }
@@ -203,7 +221,7 @@ static void cmd_ls(const char *args) {
 
         size_t entry_cap = strlen(ent->d_name) + 2;
         char  *entry     = malloc(entry_cap);
-        if (!entry) { printf("out of memory\n"); break; }
+        if (!entry) { printf("out of memory\n"); oom = true; break; }
         snprintf(entry, entry_cap, is_dir ? "%s/" : "%s", ent->d_name);
         names[n++] = entry;
     }
@@ -215,12 +233,13 @@ static void cmd_ls(const char *args) {
         free(names[i]);
     }
     free(names);
+    return !oom;
 }
 
 /* Lexes and parses any statement and prints the resulting AST without
  * running it - lets the grammar be exercised (including INSERT/UPDATE/
  * DELETE/BEGIN/COMMIT/ROLLBACK as of M5) independently of execution. */
-static void cmd_parse(const char *args) {
+static bool cmd_parse(const char *args) {
     Arena arena;
     arena_init(&arena);
 
@@ -228,13 +247,15 @@ static void cmd_parse(const char *args) {
     parser_init(&parser, args, strlen(args), &arena);
 
     Stmt *stmt = parser_parse_statement(&parser);
-    if (parser_failed(&parser)) {
+    bool  ok   = !parser_failed(&parser);
+    if (!ok) {
         printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
     } else {
         stmt_print(stdout, stmt);
     }
 
     arena_term(&arena);
+    return ok;
 }
 
 static void print_column_value(Db4Stmt *stmt, int i) {
@@ -258,11 +279,11 @@ static void print_column_value(Db4Stmt *stmt, int i) {
  * (INSERT/UPDATE/DELETE) with no transaction already open still runs as
  * its own autocommit transaction; that's interp_exec's job underneath,
  * unchanged. */
-static void cmd_sql(Db4 *db, const char *line) {
+static bool cmd_sql(Db4 *db, const char *line) {
     Db4Stmt *stmt;
     if (!db4_prepare(db, line, strlen(line), &stmt, NULL)) {
         printf("%s\n", db4_errmsg(db));
-        return;
+        return false;
     }
 
     const Stmt *ast = db4_stmt_ast(stmt);
@@ -272,7 +293,7 @@ static void cmd_sql(Db4 *db, const char *line) {
     if (rc == DB4_ERROR) {
         printf("%s\n", db4_errmsg(db));
         db4_finalize(stmt);
-        return;
+        return false;
     }
 
     if (is_select) {
@@ -296,7 +317,7 @@ static void cmd_sql(Db4 *db, const char *line) {
         if (rc == DB4_ERROR) {
             printf("%s\n", db4_errmsg(db));
             db4_finalize(stmt);
-            return;
+            return false;
         }
         printf("(%zu row%s)\n", n_rows, n_rows == 1 ? "" : "s");
     } else {
@@ -323,30 +344,83 @@ static void cmd_sql(Db4 *db, const char *line) {
     }
 
     db4_finalize(stmt);
+    return true;
 }
 
-static void dispatch(Catalog *catalog, const char *line) {
+/* Reads REPL lines from an already-open file (not stdin/linenoise - a
+ * plain fixed-buffer fgets loop, portable ISO C, matching the same
+ * "no BSD/GNU extension without the makefile already carving out a
+ * feature-test-macro rule for it" stance cmd_ls settled on above) and
+ * feeds each one through process_line, same as main()'s own loop or a
+ * nested .read. Always stops at the first non-OK result - a script
+ * failing partway should be visible, not silently skipped past, and a
+ * .quit/.exit inside the file must propagate all the way back to
+ * main() rather than just ending this one file's processing. */
+static LineResult cmd_read(Db4 *db, const char *args) {
+    char path[1024];
+    const char *p = args;
+    if (!take_quoted(&p, path, sizeof path)) {
+        printf("usage: .read \"<path>\"\n");
+        return LINE_FAIL;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("read: %s: %s\n", path, strerror(errno));
+        return LINE_FAIL;
+    }
+
+    LineResult result = LINE_OK;
+    char       line[8192];
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (line[0] == '\0') continue;
+
+        result = process_line(db, line);
+        if (result != LINE_OK) break;
+    }
+    fclose(f);
+    return result;
+}
+
+static LineResult dispatch(Db4 *db, const char *line) {
+    Catalog *catalog = &db->catalog;
     if (strncmp(line, ".load ", 6) == 0) {
-        load_csv(catalog, line + 6);
+        return load_csv(catalog, line + 6) ? LINE_OK : LINE_FAIL;
     } else if (strcmp(line, ".tables") == 0) {
         print_tables(catalog);
+        return LINE_OK;
     } else if (strncmp(line, ".schema ", 8) == 0) {
-        cmd_schema(catalog, line + 8);
+        return cmd_schema(catalog, line + 8) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".dump ", 6) == 0) {
-        cmd_dump(catalog, line + 6);
+        return cmd_dump(catalog, line + 6) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".checkpoint ", 12) == 0) {
-        cmd_checkpoint(catalog, line + 12);
+        return cmd_checkpoint(catalog, line + 12) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".parse ", 7) == 0) {
-        cmd_parse(line + 7);
+        return cmd_parse(line + 7) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".cd ", 4) == 0) {
-        cmd_cd(line + 4);
+        return cmd_cd(line + 4) ? LINE_OK : LINE_FAIL;
     } else if (strcmp(line, ".ls") == 0) {
-        cmd_ls("");
+        return cmd_ls("") ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".ls ", 4) == 0) {
-        cmd_ls(line + 4);
+        return cmd_ls(line + 4) ? LINE_OK : LINE_FAIL;
+    } else if (strncmp(line, ".read ", 6) == 0) {
+        return cmd_read(db, line + 6);
     } else {
         printf("unknown command: %s\n", line);
+        return LINE_FAIL;
     }
+}
+
+/* The one place .quit/.exit is recognized - shared by main()'s own loop
+ * and cmd_read, so a .quit reached inside a .read'd file (or a script
+ * passed on the command line) means the same thing it does typed
+ * directly: stop everything, not just the current file. */
+static LineResult process_line(Db4 *db, const char *line) {
+    if (strcmp(line, ".quit") == 0 || strcmp(line, ".exit") == 0) return LINE_QUIT;
+    if (line[0] == '.') return dispatch(db, line);
+    return cmd_sql(db, line) ? LINE_OK : LINE_FAIL;
 }
 
 /* --- Tab completion ---
@@ -377,7 +451,7 @@ static void add_completion_word(linenoiseCompletions *lc, const char *buf, size_
 }
 
 static const char *DOT_COMMANDS[] = {
-    ".load", ".tables", ".schema", ".dump", ".checkpoint", ".parse", ".cd", ".ls", ".quit", ".exit",
+    ".load", ".tables", ".schema", ".dump", ".checkpoint", ".parse", ".cd", ".ls", ".read", ".quit", ".exit",
 };
 
 /* Only while the command word itself is still being typed (no space yet)
@@ -426,15 +500,16 @@ static void complete_sql_word(linenoiseCompletions *lc, const char *buf, size_t 
 }
 
 /* Filename completion inside a quoted path argument - ".load"/".dump"'s
- * (see cmd_dump/load_csv) and ".cd"/".ls"'s (see take_quoted's doc
- * comment for why those two are quoted too). "Inside a quote" is
+ * (see cmd_dump/load_csv), ".cd"/".ls"'s (see take_quoted's doc comment
+ * for why those two are quoted too), and ".read"'s (cmd_read, below).
+ * "Inside a quote" is
  * approximated as "an odd number of '"' characters seen so far" rather
  * than a real tokenizer; good enough for the one quoted argument these
  * commands actually take, and a misfire (e.g. mid-way through .load's
  * optional quoted JSON schema argument) just yields no matches rather
  * than anything harmful. */
 static void complete_filename(linenoiseCompletions *lc, const char *buf) {
-    static const char *PATH_COMMANDS[] = { ".load ", ".dump ", ".cd ", ".ls " };
+    static const char *PATH_COMMANDS[] = { ".load ", ".dump ", ".cd ", ".ls ", ".read " };
     bool in_path_command = false;
     for (size_t i = 0; i < sizeof(PATH_COMMANDS) / sizeof(PATH_COMMANDS[0]); i++)
         if (strncmp(buf, PATH_COMMANDS[i], strlen(PATH_COMMANDS[i])) == 0) { in_path_command = true; break; }
@@ -489,7 +564,25 @@ static void repl_completion(const char *buf, linenoiseCompletions *lc) {
     complete_sql_word(lc, buf, word_start(buf, len));
 }
 
-int main(void) {
+/* Given a file to run (bin/main <path>, as opposed to piping into stdin
+ * or typing interactively), the simplest correct thing is to make that
+ * file *be* stdin: linenoise already falls back to a plain non-editing
+ * line reader (no "db4> " prompt, no history) whenever stdin isn't a
+ * terminal - proven throughout this codebase's own test suite, which
+ * pipes REPL scripts into bin/main this same way. freopen gets a script
+ * argument the exact same treatment for free, no separate reading path
+ * needed. */
+int main(int argc, char **argv) {
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [script]\n", argv[0]);
+        return 1;
+    }
+    bool batch_mode = argc == 2;
+    if (batch_mode && !freopen(argv[1], "r", stdin)) {
+        fprintf(stderr, "%s: %s: %s\n", argv[0], argv[1], strerror(errno));
+        return 1;
+    }
+
     linenoiseHistorySetMaxLen(100);
     linenoiseSetCompletionCallback(repl_completion);
 
@@ -497,6 +590,14 @@ int main(void) {
     db4_open(&db);
     g_completion_db = &db;
 
+    /* A script (batch_mode) stops at its first failure, same as
+     * cmd_read and matching sqlite3's own non-interactive default - a
+     * script failing partway should be visible, not silently run to
+     * completion past the error. Plain stdin (typed or piped, no
+     * argument given) keeps the REPL's existing "print the error, keep
+     * going" behavior unchanged - several of this project's own tests
+     * rely on being able to see state after a rejected statement. */
+    bool  had_error = false;
     char *line;
     while ((line = linenoise("db4> ")) != NULL) {
         if (line[0] == '\0') {
@@ -506,19 +607,16 @@ int main(void) {
 
         linenoiseHistoryAdd(line);
 
-        if (strcmp(line, ".quit") == 0 || strcmp(line, ".exit") == 0) {
-            linenoiseFree(line);
-            break;
-        }
-
-        if (line[0] == '.') {
-            dispatch(&db.catalog, line);
-        } else {
-            cmd_sql(&db, line);
-        }
+        LineResult result = process_line(&db, line);
         linenoiseFree(line);
+
+        if (result == LINE_QUIT) break;
+        if (result == LINE_FAIL) {
+            had_error = true;
+            if (batch_mode) break;
+        }
     }
 
     db4_close(&db);
-    return 0;
+    return had_error ? 1 : 0;
 }

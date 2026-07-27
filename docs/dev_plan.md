@@ -162,12 +162,29 @@ prototype:
   correctly rejected, a `BEGIN...INSERT...ROLLBACK` that left both the
   in-memory table and the on-disk CSV file completely unchanged, `DELETE`/
   `UPDATE` of a referenced primary key correctly blocked, and no leftover
-  `.tmp-*` files after any of the above.
+  `.tmp-*` files after any of the above. **M6 is done**: verified
+  `CREATE TABLE` with PK/FK (including `ON DELETE`/`ON UPDATE` actions
+  round-tripping through `.schema`) and its "already exists" rejection;
+  multi-row `INSERT ... VALUES (...), (...)`; arithmetic in `WHERE`/`SET`/
+  `VALUES` (`price * qty > 15`, `SET qty = qty * 2, price = -price`
+  evaluating against pre-update state so assignments don't chain, computed
+  `VALUES (2+3, 10-5)`); `qty / 0` producing `inf`/`nan` instead of
+  crashing; `INNER JOIN` with qualified/unqualified column resolution, an
+  ambiguous-column rejection when two joined tables share a column name,
+  `SELECT *` with qualified per-table headers, and `ORDER BY` across a
+  join; `COUNT(*)`/`COUNT`/`SUM`/`AVG` with `GROUP BY` (`NULL`s correctly
+  excluded from `SUM`/`AVG`/`COUNT(col)`); the `GROUP BY`+`JOIN` and
+  `GROUP BY`+`ORDER BY`/`LIMIT` rejections firing as clean errors rather
+  than parser failures (including a `GROUP BY <table>.<col>` case that
+  originally *did* surface as a raw parser error before a real parser gap
+  - qualified names in `GROUP BY` weren't handled - got fixed); and a
+  `CREATE TABLE` inside `BEGIN...ROLLBACK` correctly surviving the
+  rollback (DDL isn't undo-logged) while a same-transaction `INSERT` in a
+  pre-existing table was correctly undone.
 
-Nothing here does concurrency yet (M7), there's still no WAL (M5's
+Nothing here does concurrency yet (M7), and there's still no WAL (M5's
 follow-on step) so every commit rewrites each touched table's whole CSV
-file, and there's no `CREATE TABLE`/joins/aggregates yet (M6) — that's the
-remaining subject of this plan.
+file - that's the remaining subject of this plan.
 
 ### Stale scaffolding notes
 
@@ -378,18 +395,66 @@ The txn API (`db4_begin`/`db4_commit`/`db4_rollback`, not yet public - only
 single-writer correctness including rollback is proven end to end below,
 before M7 concurrency is on the table.
 
-### M6 — Wider SQL surface
+### M6 — Wider SQL surface — **done**
 
-Basic `INSERT INTO ... VALUES`, `UPDATE ... SET ... WHERE`, `DELETE FROM
-... WHERE` already exist (M5, literal values only - restricted grammar,
-built to give durability something to make durable). M6 grows them:
-multi-row `VALUES (...), (...)`, computed `SET`/`WHERE` expressions once
-arithmetic exists, plus what wasn't there before: `CREATE TABLE` (so a
-table can be declared instead of only inferred from a CSV load), basic
-joins (`INNER JOIN`), aggregates (`COUNT`, `SUM`, `AVG`, `GROUP BY`). Grow
-the grammar in `table.c`/M4's interpreter increment by increment — each
-new clause should be a small addition to the AST and the interpreter, not
-a rearchitecture.
+Grew M5's restricted (literal-values-only) `INSERT`/`UPDATE`/`DELETE` and
+added what wasn't there before, in the order below - each still a small
+addition to the AST/lexer/parser and `interp.c`, not a rearchitecture:
+
+- **Arithmetic** (`+ - * /`, unary `-`): `lexer.c` gained `TOK_PLUS`/
+  `TOK_MINUS`/`TOK_SLASH`; `ast.h` gained `EXPR_NEG` and the four
+  arithmetic `BinaryOp`s; `parser.c` gained the usual precedence ladder
+  (`unary` binds tighter than `term` (`*`,`/`) binds tighter than `arith`
+  (`+`,`-`) binds tighter than comparisons). This is what makes computed
+  `SET`/`WHERE`/`VALUES` expressions meaningful, so `INSERT`/`UPDATE` now
+  take the *full* expression grammar (`parse_or`) instead of M5's
+  literal-only `parse_literal` (removed - nothing calls it anymore).
+  `interp.c`'s type-checker (`infer_expr_type`) and evaluator
+  (`eval_value`) grew arithmetic cases; division always widens to
+  `DOUBLE` specifically to avoid integer division-by-zero undefined
+  behavior in C - `x/0.0` safely yields IEEE-754 `inf`/`nan` rather than
+  crashing.
+- **Qualified columns**: `lexer.c` gained `TOK_DOT`; `Expr`'s `EXPR_COLUMN`
+  case is now `{table, name}` (`table` `NULL` if unqualified) instead of a
+  bare string - needed once a query can touch more than one table (joins)
+  and for disambiguating same-named columns.
+- **Multi-row `INSERT ... VALUES (...), (...), ...`**: `InsertStmt` now
+  holds an array of `ValueRow`s instead of one. Row constraint failures
+  still abort the whole statement at the first bad row (matching
+  `UPDATE`/`DELETE`'s existing behavior) rather than skipping just that
+  row. `VALUES` expressions are still barred from referencing columns
+  (`expr_has_column_ref` rejects them with a clear error) - a fresh
+  `INSERT` row has nothing meaningful to reference yet.
+- **`CREATE TABLE <name> (<col> <type> [PRIMARY KEY] [REFERENCES
+  <table>(<col>) [ON DELETE|UPDATE CASCADE|RESTRICT|SET NULL]], ...)`**:
+  builds a scratch `Table` and only installs it into the `Catalog` once
+  every column/PK/FK check passes (same atomic-install pattern as
+  `load.c`'s loader). It's DDL - takes effect immediately, isn't
+  undo-logged (there's no "undo a CREATE TABLE" in `txn.c`, same as most
+  real engines keeping DDL outside row-level transactions), and since it
+  has no CSV path, a `CREATE TABLE`'d table is memory-only until an
+  explicit `.dump` gives it one - `COMMIT` only durably writes tables
+  that already have a path.
+- **`INNER JOIN <table> ON <expr>`** (one or more, no aliasing yet):
+  `interp.c`'s evaluator was generalized from "one `Table`+row" to a
+  `RowCtx` (an array of `{alias, Table*, row}` sources) so `WHERE`/`ON`/
+  projection can resolve a column against whichever joined table declares
+  it (or error "ambiguous" if more than one does). This single
+  generalization is what UPDATE/DELETE/plain-SELECT's WHERE evaluation
+  also now goes through (as a trivial one-source `RowCtx`), not a
+  parallel code path. `exec_select_plain` builds the joined row set with
+  a plain nested-loop join (still "no query planner yet, one reasonable
+  execution order," same principle M4 already established) - correct
+  before it's fast.
+- **Aggregates (`COUNT`, `SUM`, `AVG`) and `GROUP BY`**: recognized by
+  one-token lookahead (`peek_next` - is an identifier immediately
+  followed by `(`?) rather than making `count`/`sum`/`avg` reserved
+  keywords, so they stay usable as ordinary column names elsewhere. Scoped
+  to a single table for now - combined with `JOIN`, or with `ORDER BY`/
+  `LIMIT`, is a clear rejection (`interp_exec_select`'s `grouped` check),
+  not silently ignored or half-supported. A plain (non-aggregate) column
+  in the select list must be one of the `GROUP BY` columns, same rule
+  real SQL enforces.
 
 ### M7 — Concurrency: one writer, many readers
 

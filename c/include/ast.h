@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "table.h"
+
 typedef enum {
     EXPR_COLUMN,
     EXPR_LIT_INT,
@@ -13,6 +15,7 @@ typedef enum {
     EXPR_LIT_BOOL,
     EXPR_LIT_NULL,
     EXPR_NOT,
+    EXPR_NEG,
     EXPR_BINARY,
 } ExprKind;
 
@@ -25,17 +28,24 @@ typedef enum {
     OP_GE,
     OP_AND,
     OP_OR,
+    OP_ADD,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
 } BinaryOp;
 
 typedef struct Expr Expr;
 
 /* All pointers/strings here are arena-allocated by the parser, into the
- * same arena as the enclosing SelectStmt - the whole tree is one
- * "throw it away as a unit" lifetime. */
+ * same arena as the enclosing Stmt - the whole tree is one "throw it away
+ * as a unit" lifetime. */
 struct Expr {
     ExprKind kind;
     union {
-        const char *column;
+        struct {
+            const char *table; /* qualifier ("t.col") - NULL if unqualified */
+            const char *name;
+        } column;
 
         int64_t int_value;
         double  double_value;
@@ -45,7 +55,7 @@ struct Expr {
             size_t      len;
         } string_value;
 
-        Expr *not_operand;
+        Expr *unary_operand; /* EXPR_NOT, EXPR_NEG */
 
         struct {
             BinaryOp op;
@@ -56,35 +66,69 @@ struct Expr {
 };
 
 typedef struct {
-    char  **names;
-    size_t  count;
-    bool    is_star;
+    char *table; /* the joined table's name (no aliasing yet) */
+    Expr *on;
+} JoinClause;
+
+typedef enum {
+    AGG_COUNT,
+    AGG_SUM,
+    AGG_AVG,
+} AggFunc;
+
+/* One entry in a SELECT's column list - either a plain (optionally
+ * table-qualified) column reference, or an aggregate call. */
+typedef struct {
+    bool is_agg;
+
+    const char *table;  /* plain projection only - qualifier, NULL if none */
+    const char *column; /* plain projection only */
+
+    AggFunc     agg_func;      /* aggregate only */
+    bool        agg_arg_is_star; /* aggregate only - COUNT(*) */
+    const char *agg_arg_table;   /* aggregate only - qualifier, NULL if none */
+    const char *agg_arg_column;  /* aggregate only - NULL if agg_arg_is_star */
+} SelectItem;
+
+typedef struct {
+    SelectItem *items;
+    size_t      count;
+    bool        is_star;
 } ColumnList;
 
 typedef struct {
     ColumnList columns;
     char      *table;
 
+    JoinClause *joins; /* zero or more INNER JOINs, applied left to right */
+    size_t      n_joins;
+
     Expr *where;
 
+    char  **group_by;
+    size_t  n_group_by;
+
     bool  has_order_by;
-    char *order_by_col;
+    const char *order_by_table; /* qualifier, NULL if unqualified */
+    const char *order_by_col;
     bool  order_desc;
 
     bool    has_limit;
     int64_t limit;
 } SelectStmt;
 
-/* INSERT/UPDATE values are restricted to literals (no arithmetic exists
- * yet to justify accepting general expressions here) - each Expr* below
- * is always one of the EXPR_LIT_* kinds. */
 typedef struct {
-    char   *table;
-    char  **columns;    /* NULL if the "(col, ...)" list was omitted -
-                         * values then map onto all table columns in order */
-    size_t  n_columns;
     Expr  **values;
     size_t  n_values;
+} ValueRow;
+
+typedef struct {
+    char     *table;
+    char    **columns; /* NULL if the "(col, ...)" list was omitted -
+                        * values then map onto all table columns in order */
+    size_t    n_columns;
+    ValueRow *rows; /* one or more "(v1, v2, ...)" tuples */
+    size_t    n_rows;
 } InsertStmt;
 
 typedef struct {
@@ -104,11 +148,30 @@ typedef struct {
     Expr *where;
 } DeleteStmt;
 
+typedef struct {
+    char     *name;
+    FieldType type;
+    bool      primary;
+
+    bool      has_fk;
+    char     *fk_table;
+    char     *fk_column;
+    FkAction  fk_on_delete;
+    FkAction  fk_on_update;
+} ColumnDef;
+
+typedef struct {
+    char      *table;
+    ColumnDef *columns;
+    size_t     n_columns;
+} CreateTableStmt;
+
 typedef enum {
     STMT_SELECT,
     STMT_INSERT,
     STMT_UPDATE,
     STMT_DELETE,
+    STMT_CREATE_TABLE,
     STMT_BEGIN,
     STMT_COMMIT,
     STMT_ROLLBACK,
@@ -117,10 +180,11 @@ typedef enum {
 typedef struct {
     StmtKind kind;
     union {
-        SelectStmt select;
-        InsertStmt insert;
-        UpdateStmt update;
-        DeleteStmt del;
+        SelectStmt      select;
+        InsertStmt      insert;
+        UpdateStmt      update;
+        DeleteStmt      del;
+        CreateTableStmt create_table;
     } as;
 } Stmt;
 

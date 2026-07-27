@@ -36,6 +36,18 @@ static const Keyword KEYWORDS[] = {
     {"commit",      TOK_COMMIT},
     {"rollback",    TOK_ROLLBACK},
     {"transaction", TOK_TRANSACTION},
+
+    {"create",     TOK_CREATE},
+    {"table",      TOK_TABLE},
+    {"primary",    TOK_PRIMARY},
+    {"key",        TOK_KEY},
+    {"references", TOK_REFERENCES},
+    {"on",         TOK_ON},
+    {"cascade",    TOK_CASCADE},
+    {"restrict",   TOK_RESTRICT},
+    {"join",       TOK_JOIN},
+    {"inner",      TOK_INNER},
+    {"group",      TOK_GROUP},
 };
 
 static bool ident_start(char c) { return isalpha((unsigned char)c) || c == '_'; }
@@ -129,10 +141,14 @@ Token lexer_next(Lexer *lx) {
     switch (c) {
         case '*': lx->pos++; return make(TOK_STAR, start, 1, line);
         case ',': lx->pos++; return make(TOK_COMMA, start, 1, line);
+        case '.': lx->pos++; return make(TOK_DOT, start, 1, line);
         case ';': lx->pos++; return make(TOK_SEMICOLON, start, 1, line);
         case '(': lx->pos++; return make(TOK_LPAREN, start, 1, line);
         case ')': lx->pos++; return make(TOK_RPAREN, start, 1, line);
         case '=': lx->pos++; return make(TOK_EQ, start, 1, line);
+        case '+': lx->pos++; return make(TOK_PLUS, start, 1, line);
+        case '-': lx->pos++; return make(TOK_MINUS, start, 1, line);
+        case '/': lx->pos++; return make(TOK_SLASH, start, 1, line);
         case '!':
             if (peek_at(lx, 1) == '=') { lx->pos += 2; return make(TOK_NE, start, 2, line); }
             break;
@@ -184,8 +200,20 @@ const char *token_type_name(TokenType type) {
         case TOK_COMMIT:      return "COMMIT";
         case TOK_ROLLBACK:    return "ROLLBACK";
         case TOK_TRANSACTION: return "TRANSACTION";
+        case TOK_CREATE:     return "CREATE";
+        case TOK_TABLE:      return "TABLE";
+        case TOK_PRIMARY:    return "PRIMARY";
+        case TOK_KEY:        return "KEY";
+        case TOK_REFERENCES: return "REFERENCES";
+        case TOK_ON:         return "ON";
+        case TOK_CASCADE:    return "CASCADE";
+        case TOK_RESTRICT:   return "RESTRICT";
+        case TOK_JOIN:       return "JOIN";
+        case TOK_INNER:      return "INNER";
+        case TOK_GROUP:      return "GROUP";
         case TOK_STAR:      return "*";
         case TOK_COMMA:     return ",";
+        case TOK_DOT:       return ".";
         case TOK_SEMICOLON: return ";";
         case TOK_LPAREN:    return "(";
         case TOK_RPAREN:    return ")";
@@ -195,6 +223,9 @@ const char *token_type_name(TokenType type) {
         case TOK_LE:        return "<=";
         case TOK_GT:        return ">";
         case TOK_GE:        return ">=";
+        case TOK_PLUS:      return "+";
+        case TOK_MINUS:     return "-";
+        case TOK_SLASH:     return "/";
     }
     return "?";
 }

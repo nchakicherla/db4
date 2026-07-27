@@ -38,8 +38,21 @@ typedef enum {
     TOK_ROLLBACK,
     TOK_TRANSACTION,
 
+    TOK_CREATE,
+    TOK_TABLE,
+    TOK_PRIMARY,
+    TOK_KEY,
+    TOK_REFERENCES,
+    TOK_ON,
+    TOK_CASCADE,
+    TOK_RESTRICT,
+    TOK_JOIN,
+    TOK_INNER,
+    TOK_GROUP,
+
     TOK_STAR,
     TOK_COMMA,
+    TOK_DOT,
     TOK_SEMICOLON,
     TOK_LPAREN,
     TOK_RPAREN,
@@ -49,6 +62,9 @@ typedef enum {
     TOK_LE,
     TOK_GT,
     TOK_GE,
+    TOK_PLUS,
+    TOK_MINUS,
+    TOK_SLASH,
 } TokenType;
 
 /* start/len point into the Lexer's source buffer - the caller owns that

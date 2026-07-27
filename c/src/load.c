@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "arena.h"
 #include "budget.h"
@@ -382,7 +383,7 @@ void load_csv(Catalog *catalog, const char *args) {
         n_loaded++;
     }
 
-    Table *slot = catalog_put(catalog, name);
+    Table *slot = catalog_put(catalog, name, path);
     if (!slot) goto oom;
     *slot = new_table;
 
@@ -453,13 +454,7 @@ static bool dump_cell(FILE *f, const Table *t, size_t row, size_t col) {
     }
 }
 
-bool dump_csv(const Table *t, const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        printf("could not open %s for writing\n", path);
-        return false;
-    }
-
+static bool write_csv_body(FILE *f, const Table *t, const char *path) {
     for (size_t col = 0; col < t->n_cols; col++) {
         if (col) fputc(',', f);
         write_csv_field(f, t->names[col], strlen(t->names[col]));
@@ -472,14 +467,52 @@ bool dump_csv(const Table *t, const char *path) {
             if (col) fputc(',', f);
             if (!dump_cell(f, t, row, col)) {
                 printf("write error while dumping to %s\n", path);
-                fclose(f);
                 return false;
             }
         }
         fputc('\n', f);
     }
+    return true;
+}
 
+/* Writes to a temp file beside path, fsyncs it, then rename()s over path -
+ * the write is atomic from any outside observer's point of view (readers
+ * see either the whole old file or the whole new one, never a partial
+ * write), which is what M5's "nothing durable until commit" needs and
+ * what .dump gets for free by sharing this. */
+bool dump_csv(const Table *t, const char *path) {
+    char tmp_path[4096];
+    int n = snprintf(tmp_path, sizeof tmp_path, "%s.tmp-%d", path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof tmp_path) {
+        printf("path too long: %s\n", path);
+        return false;
+    }
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        printf("could not open %s for writing\n", tmp_path);
+        return false;
+    }
+
+    if (!write_csv_body(f, t, tmp_path)) {
+        fclose(f);
+        remove(tmp_path);
+        return false;
+    }
+
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+        printf("write error while dumping to %s\n", tmp_path);
+        fclose(f);
+        remove(tmp_path);
+        return false;
+    }
     fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        printf("could not replace %s with %s\n", path, tmp_path);
+        remove(tmp_path);
+        return false;
+    }
     return true;
 }
 

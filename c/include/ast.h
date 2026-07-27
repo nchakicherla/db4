@@ -75,4 +75,53 @@ typedef struct {
     int64_t limit;
 } SelectStmt;
 
+/* INSERT/UPDATE values are restricted to literals (no arithmetic exists
+ * yet to justify accepting general expressions here) - each Expr* below
+ * is always one of the EXPR_LIT_* kinds. */
+typedef struct {
+    char   *table;
+    char  **columns;    /* NULL if the "(col, ...)" list was omitted -
+                         * values then map onto all table columns in order */
+    size_t  n_columns;
+    Expr  **values;
+    size_t  n_values;
+} InsertStmt;
+
+typedef struct {
+    char *column;
+    Expr *value;
+} Assignment;
+
+typedef struct {
+    char       *table;
+    Assignment *assignments;
+    size_t      n_assignments;
+    Expr       *where;
+} UpdateStmt;
+
+typedef struct {
+    char *table;
+    Expr *where;
+} DeleteStmt;
+
+typedef enum {
+    STMT_SELECT,
+    STMT_INSERT,
+    STMT_UPDATE,
+    STMT_DELETE,
+    STMT_BEGIN,
+    STMT_COMMIT,
+    STMT_ROLLBACK,
+} StmtKind;
+
+typedef struct {
+    StmtKind kind;
+    union {
+        SelectStmt select;
+        InsertStmt insert;
+        UpdateStmt update;
+        DeleteStmt del;
+    } as;
+} Stmt;
+
 #endif

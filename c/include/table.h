@@ -60,6 +60,7 @@ int table_find_column(const Table *t, const char *name);
 
 size_t table_append_row(Table *t);
 void   table_delete_row(Table *t, size_t row);
+void   table_undelete_row(Table *t, size_t row);
 bool   table_row_is_dead(const Table *t, size_t row);
 
 void table_set_null(Table *t, size_t row, size_t col);

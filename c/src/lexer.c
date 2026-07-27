@@ -25,6 +25,17 @@ static const Keyword KEYWORDS[] = {
     {"null",   TOK_NULL},
     {"true",   TOK_TRUE},
     {"false",  TOK_FALSE},
+
+    {"insert",      TOK_INSERT},
+    {"into",        TOK_INTO},
+    {"values",      TOK_VALUES},
+    {"update",      TOK_UPDATE},
+    {"set",         TOK_SET},
+    {"delete",      TOK_DELETE},
+    {"begin",       TOK_BEGIN},
+    {"commit",      TOK_COMMIT},
+    {"rollback",    TOK_ROLLBACK},
+    {"transaction", TOK_TRANSACTION},
 };
 
 static bool ident_start(char c) { return isalpha((unsigned char)c) || c == '_'; }
@@ -163,6 +174,16 @@ const char *token_type_name(TokenType type) {
         case TOK_NULL:      return "NULL";
         case TOK_TRUE:      return "TRUE";
         case TOK_FALSE:     return "FALSE";
+        case TOK_INSERT:      return "INSERT";
+        case TOK_INTO:        return "INTO";
+        case TOK_VALUES:      return "VALUES";
+        case TOK_UPDATE:      return "UPDATE";
+        case TOK_SET:         return "SET";
+        case TOK_DELETE:      return "DELETE";
+        case TOK_BEGIN:       return "BEGIN";
+        case TOK_COMMIT:      return "COMMIT";
+        case TOK_ROLLBACK:    return "ROLLBACK";
+        case TOK_TRANSACTION: return "TRANSACTION";
         case TOK_STAR:      return "*";
         case TOK_COMMA:     return ",";
         case TOK_SEMICOLON: return ";";

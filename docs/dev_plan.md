@@ -100,11 +100,49 @@ prototype:
   `ORDER BY` sorts matching row indices with `qsort` (`NULL` sorts first
   ascending / last descending); `LIMIT` truncates after sorting, since a
   correct limit has to see the final order first.
+- Lexer/AST/parser grammar (M5): `INSERT INTO <table> [(<cols>)] VALUES
+  (<literals>)`, `UPDATE <table> SET <col> = <literal>, ... [WHERE
+  <expr>]`, `DELETE FROM <table> [WHERE <expr>]`, and `BEGIN
+  [TRANSACTION]`/`COMMIT`/`ROLLBACK`. `INSERT`/`UPDATE` values are
+  restricted to literals (`parse_literal` in `parser.c`) rather than the
+  general expression grammar - there's no arithmetic yet to make anything
+  richer meaningful there. `ast.h` wraps all seven statement kinds in one
+  `Stmt`, parsed by `parser_parse_statement`.
+- [interp.c](../c/src/interp.c) grew `interp_exec` (M5): dispatches a
+  `Stmt` to `interp_exec_select`/`_insert`/`_update`/`_delete`, or to
+  `BEGIN`/`COMMIT`/`ROLLBACK` handling. `INSERT`/`UPDATE` run the same
+  `check_row_constraints` load.c's loader runs per row (PK not-null/
+  unique, FK target exists) before the mutation is allowed to stand, and
+  `DELETE`/an `UPDATE` of the primary key additionally run
+  `check_pk_not_referenced` first: no FK action (`CASCADE`/`SET_NULL`) is
+  implemented yet, so the only safe default is to block anything that
+  would orphan a row elsewhere that references this one, regardless of
+  which action was declared - a known, deliberate gap (real cascade/
+  set-null behavior is still to be written), not silent corruption.
+  A mutating statement with no explicit `BEGIN` open runs as its own
+  autocommit transaction (begin, execute, commit-or-rollback) so a bare
+  `INSERT` is exactly as durable as one wrapped in `BEGIN...COMMIT`.
+- [txn.h](../c/include/txn.h) / `txn.c` — **M5's transaction manager**: a
+  `Txn` holds an undo log (`UndoEntry`), one entry per mutated row.
+  Undoing an insert tombstones the row (`table_delete_row`); undoing a
+  delete clears the tombstone (new `table_undelete_row` in `table.c`);
+  undoing an update restores the cell's prior value/null-state captured
+  before the overwrite (TEXT is captured as a `StringRef`, not a copied
+  string, since `table.c`'s heap is append-only and the old bytes stay
+  valid until a `table_compact_heap` that never runs mid-transaction).
+  `txn_commit` hands the caller the distinct table names touched, for
+  `interp.c` to durably `dump_csv` each one - `txn.c` itself only knows
+  about `Table`, not `Catalog`, matching the layered architecture (the
+  transaction manager sits below the catalog, so it can't depend on it).
+- [catalog.h](../c/include/catalog.h)'s `NamedTable` gained a `path` field
+  (M5) - `catalog_put` now takes the source CSV path so `COMMIT` knows
+  where to durably write each mutated table back to.
 - `main.c` — a linenoise REPL dispatching `.load`, `.tables`, `.schema
   <table>`, `.dump <table> "<path>"`, `.parse <sql>`, `.quit`/`.exit`, and
-  now (M4) a bare (non-dot) line: parsed and run as a `SELECT` against the
-  catalog. **M1 is done**: verified end to end with multi-table loads, a
-  valid foreign key reference, a rejected foreign key reference (atomic
+  a bare (non-dot) line: parsed (as of M5, any statement, not just
+  `SELECT`) and run against the catalog and the REPL's one `Txn`.
+  **M1 is done**: verified end to end with multi-table loads, a valid
+  foreign key reference, a rejected foreign key reference (atomic
   failure, confirmed the referencing table never got installed), and a
   round-trip dump. **M3 is done**: `.parse` verified against precedence
   (`AND` binding tighter than `OR`), parenthesized/`NOT` subexpressions,
@@ -116,11 +154,20 @@ prototype:
   text-vs-int), unknown table/column errors, `NULL`'s three-valued
   behavior (`WHERE age = age` correctly excludes a `NULL`-age row instead
   of treating self-equality as always true), `ORDER BY ... DESC` with a
-  `NULL` value, and `LIMIT`.
+  `NULL` value, and `LIMIT`. **M5's short-term step is done**: verified
+  autocommit `INSERT`/`UPDATE`/`DELETE` with PK/FK/arity/type-mismatch
+  rejections, an explicit multi-statement/multi-table `BEGIN...COMMIT`
+  (both tables' CSV files durably updated together), nested `BEGIN`
+  correctly rejected, `COMMIT`/`ROLLBACK` with no active transaction
+  correctly rejected, a `BEGIN...INSERT...ROLLBACK` that left both the
+  in-memory table and the on-disk CSV file completely unchanged, `DELETE`/
+  `UPDATE` of a referenced primary key correctly blocked, and no leftover
+  `.tmp-*` files after any of the above.
 
-Nothing here does transactions or concurrency yet, and nothing beyond
-`SELECT` can be written as SQL yet (M6 adds `INSERT`/`UPDATE`/`DELETE`/
-`CREATE TABLE`) — that's the remaining subject of this plan.
+Nothing here does concurrency yet (M7), there's still no WAL (M5's
+follow-on step) so every commit rewrites each touched table's whole CSV
+file, and there's no `CREATE TABLE`/joins/aggregates yet (M6) — that's the
+remaining subject of this plan.
 
 ### Stale scaffolding notes
 
@@ -299,36 +346,50 @@ No query planner yet — one reasonable execution order per query shape
 (filter, then sort, then limit) - and this is a good place to pause and
 get comfortable before touching durability.
 
-### M5 — Durability: WAL and atomic commit
+### M5 — Durability: WAL and atomic commit — **short-term step done**
 
 This is where CSV-as-storage gets its first real replacement pressure.
-Introduce `INSERT`/`UPDATE`/`DELETE` and, with them, the requirement that a
+Introduces `INSERT`/`UPDATE`/`DELETE` and, with them, the requirement that a
 crash mid-write can't corrupt the table. Concretely:
 
-1. Short term: whole-table snapshot + atomic rename (write a new temp file,
-   `fsync`, `rename()` over the original) — trivially atomic, no
-   partial-write states possible, and it's the correct *first* step because
-   it establishes the transaction boundary (`BEGIN`/`COMMIT`/`ROLLBACK`) and
-   the "nothing durable until commit" contract without needing a page format
-   yet.
-2. Follow-on: an append-only WAL of row-level changes (`txn_id`, op, row
-   bytes, checksum) so commit is an `fsync` of a small append rather than a
-   rewrite of the whole table; a checkpoint step periodically folds the WAL
-   back into the base CSV. This is the direct precursor to M7 (WAL is what
-   also buys concurrent readers).
+1. **Short term (done): whole-table snapshot + atomic rename** (write a
+   new temp file, `fsync`, `rename()` over the original) — trivially
+   atomic, no partial-write states possible, and it's the correct *first*
+   step because it establishes the transaction boundary (`BEGIN`/`COMMIT`/
+   `ROLLBACK`) and the "nothing durable until commit" contract without
+   needing a page format yet. See "Where things stand" above for
+   [txn.h](../c/include/txn.h) / `txn.c` and the lexer/parser/`interp.c`
+   grammar this needed. `dump_csv` (in `load.c`, used by both `.dump` and
+   commit) now does the temp-write/`fsync`/`rename` itself, so `.dump`
+   gets the same atomicity for free.
+2. **Follow-on (not done): an append-only WAL** of row-level changes
+   (`txn_id`, op, row bytes, checksum) so commit is an `fsync` of a small
+   append rather than a rewrite of the whole table; a checkpoint step
+   periodically folds the WAL back into the base CSV. This is the direct
+   precursor to M7 (WAL is what also buys concurrent readers) - deferred
+   because the milestone's own text frames it as a distinct follow-on
+   refinement, not a blocker: every autocommit or explicit `COMMIT`
+   already rewrites and durably replaces the touched tables' whole CSV
+   files today, which is correct (if not yet cheap) durability. `wal.c`/
+   `wal.h` are still to be written.
 
-Get the txn API (`db4_begin`/`db4_commit`/`db4_rollback`) solid here, before
-concurrency, so single-writer correctness (including crash recovery) is
-proven first.
+The txn API (`db4_begin`/`db4_commit`/`db4_rollback`, not yet public - only
+`main.c`'s REPL calls into it, same as every milestone before M8) is solid:
+single-writer correctness including rollback is proven end to end below,
+before M7 concurrency is on the table.
 
 ### M6 — Wider SQL surface
 
-`INSERT INTO ... VALUES`, `UPDATE ... SET ... WHERE`, `DELETE FROM ... WHERE`,
-`CREATE TABLE` (so a table can be declared instead of only inferred from a
-CSV load), basic joins (`INNER JOIN`), aggregates (`COUNT`, `SUM`, `AVG`,
-`GROUP BY`). Grow the grammar in `table.c`/M4's interpreter increment by
-increment — each new clause should be a small addition to the AST and the
-interpreter, not a rearchitecture.
+Basic `INSERT INTO ... VALUES`, `UPDATE ... SET ... WHERE`, `DELETE FROM
+... WHERE` already exist (M5, literal values only - restricted grammar,
+built to give durability something to make durable). M6 grows them:
+multi-row `VALUES (...), (...)`, computed `SET`/`WHERE` expressions once
+arithmetic exists, plus what wasn't there before: `CREATE TABLE` (so a
+table can be declared instead of only inferred from a CSV load), basic
+joins (`INNER JOIN`), aggregates (`COUNT`, `SUM`, `AVG`, `GROUP BY`). Grow
+the grammar in `table.c`/M4's interpreter increment by increment — each
+new clause should be a small addition to the AST and the interpreter, not
+a rearchitecture.
 
 ### M7 — Concurrency: one writer, many readers
 
@@ -368,8 +429,8 @@ concurrent *writers*, not just concurrent readers.
 | `ast.h` | AST node types (done) | M3 |
 | `cursor.c`/`cursor.h` | row iteration over a `Table` (done) | M4 |
 | `interp.c`/`interp.h` | tree-walking query executor (done) | M4 |
-| `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping | M5 |
-| `wal.c`/`wal.h` | append-only write-ahead log, checkpointing | M5 |
+| `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping (done) | M5 |
+| `wal.c`/`wal.h` | append-only write-ahead log, checkpointing | M5 (follow-on, not started) |
 | `lock.c`/`lock.h` | reader/writer coordination | M7 |
 | `pager.c`/`pager.h` | fixed-size page file, free list | M8 |
 | `btree.c`/`btree.h` | table/index b-trees over pages | M8 |

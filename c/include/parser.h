@@ -29,10 +29,16 @@ void parser_init(Parser *p, const char *sql, size_t len, Arena *a);
  * [LIMIT <n>] [;]". Returns NULL on failure - check parser_failed(p). */
 SelectStmt *parser_parse_select(Parser *p);
 
+/* Parses any one of SELECT/INSERT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK,
+ * dispatching on the leading keyword. Returns NULL on failure - check
+ * parser_failed(p). */
+Stmt *parser_parse_statement(Parser *p);
+
 bool        parser_failed(const Parser *p);
 const char *parser_error(const Parser *p);
 size_t      parser_error_line(const Parser *p);
 
 void select_stmt_print(FILE *f, const SelectStmt *stmt);
+void stmt_print(FILE *f, const Stmt *stmt);
 
 #endif

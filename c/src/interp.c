@@ -5,6 +5,7 @@
 
 #include "cursor.h"
 #include "field.h"
+#include "load.h"
 
 typedef enum {
     ETYPE_INT,
@@ -371,4 +372,356 @@ bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, FILE *ou
     free(rows);
     free(proj_cols);
     return true;
+}
+
+/* Shared by INSERT (validate the freshly appended row) and UPDATE
+ * (validate the just-modified row) - the same checks load.c's loader runs
+ * per row, just against the catalog's current state instead of a
+ * scratch table being built up. */
+static bool check_row_constraints(const Table *t, size_t row, const Catalog *catalog, char *err, size_t err_len) {
+    for (size_t col = 0; col < t->n_cols; col++) {
+        if (table_is_primary_key(t, col)) {
+            if (table_is_null(t, row, col)) {
+                snprintf(err, err_len, "primary key column \"%s\" cannot be NULL", t->names[col]);
+                return false;
+            }
+            if (table_column_has_duplicate(t, col, row)) {
+                snprintf(err, err_len, "duplicate value in primary key column \"%s\"", t->names[col]);
+                return false;
+            }
+        }
+
+        const char *ref_table_name, *ref_col_name;
+        if (!table_get_foreign_key(t, col, &ref_table_name, &ref_col_name)) continue;
+        if (table_is_null(t, row, col)) continue;
+
+        int ref_idx = catalog_find(catalog, ref_table_name);
+        if (ref_idx < 0) continue;
+        const Table *ref_table = &catalog->tables[ref_idx].table;
+        int ref_col = table_find_column(ref_table, ref_col_name);
+        if (ref_col < 0) continue;
+
+        if (!table_has_matching_value(ref_table, (size_t)ref_col, t, row, col)) {
+            snprintf(err, err_len, "value in foreign key column \"%s\" not found in %s.%s",
+                     t->names[col], ref_table_name, ref_col_name);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* No FK action (CASCADE/SET_NULL) is implemented yet - table_set_foreign_key
+ * still records which one was declared, but the only thing enforced here is
+ * the safety floor every action needs anyway: never let a DELETE or an
+ * UPDATE of the primary key silently orphan a row elsewhere that points at
+ * it. FKs can only ever target a primary key column (load.c's loader
+ * already requires that), so this only has to look at t's own pk_col. */
+static bool check_pk_not_referenced(const Catalog *catalog, const Table *t, const char *table_name,
+                                     size_t row, char *err, size_t err_len) {
+    if (t->pk_col < 0) return true;
+    size_t col = (size_t)t->pk_col;
+    if (table_is_null(t, row, col)) return true;
+
+    for (size_t i = 0; i < catalog->count; i++) {
+        const Table *other = &catalog->tables[i].table;
+        for (size_t c = 0; c < other->n_cols; c++) {
+            const char *ref_table, *ref_col;
+            if (!table_get_foreign_key(other, c, &ref_table, &ref_col)) continue;
+            if (strcmp(ref_table, table_name) != 0) continue;
+            if (strcmp(ref_col, t->names[col]) != 0) continue;
+
+            if (table_has_matching_value(other, c, t, row, col)) {
+                snprintf(err, err_len, "row is referenced by %s.%s (foreign key)", catalog->tables[i].name, other->names[c]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool literal_fits_column(const Expr *lit, FieldType col_type, const char *col_name, char *err, size_t err_len) {
+    if (lit->kind == EXPR_LIT_NULL) return true;
+
+    FieldType lit_type;
+    switch (lit->kind) {
+        case EXPR_LIT_INT:    lit_type = FT_INT; break;
+        case EXPR_LIT_DOUBLE: lit_type = FT_DOUBLE; break;
+        case EXPR_LIT_BOOL:   lit_type = FT_BOOL; break;
+        case EXPR_LIT_STRING: lit_type = FT_TEXT; break;
+        default:
+            snprintf(err, err_len, "value for column \"%s\" must be a literal", col_name);
+            return false;
+    }
+
+    if (lit_type == col_type) return true;
+    if (lit_type == FT_INT && col_type == FT_DOUBLE) return true; /* widen, like an int literal into a double column */
+
+    snprintf(err, err_len, "column \"%s\" is type %s but value is type %s",
+             col_name, field_type_label(col_type), field_type_label(lit_type));
+    return false;
+}
+
+static void assign_literal(Table *t, size_t row, size_t col, const Expr *lit) {
+    if (lit->kind == EXPR_LIT_NULL) {
+        table_set_null(t, row, col);
+        return;
+    }
+    switch (t->types[col]) {
+        case FT_INT:    table_set_int(t, row, col, lit->as.int_value); break;
+        case FT_DOUBLE: table_set_double(t, row, col, lit->kind == EXPR_LIT_INT ? (double)lit->as.int_value : lit->as.double_value); break;
+        case FT_BOOL:   table_set_bool(t, row, col, lit->as.bool_value); break;
+        case FT_TEXT:   table_set_text(t, row, col, lit->as.string_value.data, lit->as.string_value.len); break;
+        default: break;
+    }
+}
+
+static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+    int t_idx = catalog_find(catalog, stmt->table);
+    if (t_idx < 0) {
+        snprintf(err, err_len, "no such table: %s", stmt->table);
+        return false;
+    }
+    Table *t = &catalog->tables[t_idx].table;
+
+    size_t n_target = stmt->n_columns ? stmt->n_columns : t->n_cols;
+    if (stmt->n_values != n_target) {
+        snprintf(err, err_len, "%zu value%s provided for %zu column%s",
+                 stmt->n_values, stmt->n_values == 1 ? "" : "s", n_target, n_target == 1 ? "" : "s");
+        return false;
+    }
+
+    int *cols = malloc(n_target * sizeof(int));
+    if (!cols) {
+        snprintf(err, err_len, "out of memory");
+        return false;
+    }
+
+    if (stmt->n_columns) {
+        for (size_t i = 0; i < stmt->n_columns; i++) {
+            int col = table_find_column(t, stmt->columns[i]);
+            if (col < 0) {
+                snprintf(err, err_len, "no such column \"%s\" in table \"%s\"", stmt->columns[i], stmt->table);
+                free(cols);
+                return false;
+            }
+            cols[i] = col;
+        }
+        for (size_t i = 0; i < stmt->n_columns; i++)
+            for (size_t j = i + 1; j < stmt->n_columns; j++)
+                if (cols[i] == cols[j]) {
+                    snprintf(err, err_len, "column \"%s\" specified more than once", stmt->columns[i]);
+                    free(cols);
+                    return false;
+                }
+    } else {
+        for (size_t i = 0; i < n_target; i++) cols[i] = (int)i;
+    }
+
+    for (size_t i = 0; i < n_target; i++) {
+        if (!literal_fits_column(stmt->values[i], t->types[cols[i]], t->names[cols[i]], err, err_len)) {
+            free(cols);
+            return false;
+        }
+    }
+
+    size_t row = table_append_row(t);
+    if (row == SIZE_MAX || table_failed(t)) {
+        snprintf(err, err_len, "out of memory inserting into %s", stmt->table);
+        free(cols);
+        return false;
+    }
+
+    for (size_t i = 0; i < n_target; i++)
+        assign_literal(t, row, cols[i], stmt->values[i]);
+
+    if (!check_row_constraints(t, row, catalog, err, err_len)) {
+        table_delete_row(t, row);
+        free(cols);
+        return false;
+    }
+
+    if (txn) txn_log_insert(txn, t, catalog->tables[t_idx].name, row);
+
+    free(cols);
+    fprintf(out, "1 row inserted\n");
+    return true;
+}
+
+static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+    int t_idx = catalog_find(catalog, stmt->table);
+    if (t_idx < 0) {
+        snprintf(err, err_len, "no such table: %s", stmt->table);
+        return false;
+    }
+    Table *t = &catalog->tables[t_idx].table;
+
+    int *cols = malloc(stmt->n_assignments * sizeof(int));
+    if (!cols) {
+        snprintf(err, err_len, "out of memory");
+        return false;
+    }
+
+    bool pk_updated = false;
+    for (size_t i = 0; i < stmt->n_assignments; i++) {
+        int col = table_find_column(t, stmt->assignments[i].column);
+        if (col < 0) {
+            snprintf(err, err_len, "no such column \"%s\" in table \"%s\"", stmt->assignments[i].column, stmt->table);
+            free(cols);
+            return false;
+        }
+        if (!literal_fits_column(stmt->assignments[i].value, t->types[col], t->names[col], err, err_len)) {
+            free(cols);
+            return false;
+        }
+        cols[i] = col;
+        if (col == t->pk_col) pk_updated = true;
+    }
+
+    if (stmt->where && !validate_where(stmt->where, t, err, err_len)) {
+        free(cols);
+        return false;
+    }
+
+    size_t n_updated = 0;
+    Cursor cur;
+    cursor_init(&cur, t);
+    size_t row;
+    while (cursor_next(&cur, &row)) {
+        if (stmt->where && eval_tri(stmt->where, t, row) != TRI_TRUE) continue;
+
+        if (pk_updated && !check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) {
+            free(cols);
+            return false;
+        }
+
+        for (size_t i = 0; i < stmt->n_assignments; i++) {
+            if (txn) txn_log_update(txn, t, catalog->tables[t_idx].name, row, (size_t)cols[i]);
+            assign_literal(t, row, cols[i], stmt->assignments[i].value);
+        }
+
+        if (!check_row_constraints(t, row, catalog, err, err_len)) {
+            free(cols);
+            return false;
+        }
+        n_updated++;
+    }
+
+    free(cols);
+    fprintf(out, "%zu row%s updated\n", n_updated, n_updated == 1 ? "" : "s");
+    return true;
+}
+
+static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+    int t_idx = catalog_find(catalog, stmt->table);
+    if (t_idx < 0) {
+        snprintf(err, err_len, "no such table: %s", stmt->table);
+        return false;
+    }
+    Table *t = &catalog->tables[t_idx].table;
+
+    if (stmt->where && !validate_where(stmt->where, t, err, err_len)) return false;
+
+    size_t n_deleted = 0;
+    Cursor cur;
+    cursor_init(&cur, t);
+    size_t row;
+    while (cursor_next(&cur, &row)) {
+        if (stmt->where && eval_tri(stmt->where, t, row) != TRI_TRUE) continue;
+
+        if (!check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) return false;
+
+        if (txn) txn_log_delete(txn, t, catalog->tables[t_idx].name, row);
+        table_delete_row(t, row);
+        n_deleted++;
+    }
+
+    fprintf(out, "%zu row%s deleted\n", n_deleted, n_deleted == 1 ? "" : "s");
+    return true;
+}
+
+/* Durability: every table touched since BEGIN gets dump_csv's atomic
+ * write-temp/fsync/rename back to the path it was loaded from - "nothing
+ * durable until commit" (M5's short-term approach; the WAL follow-on that
+ * avoids a whole-table rewrite per commit is still ahead of us). */
+static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err_len) {
+    if (!txn->active) {
+        snprintf(err, err_len, "no transaction is active");
+        return false;
+    }
+
+    const char **names = malloc(catalog->count * sizeof(char *));
+    if (!names && catalog->count) {
+        snprintf(err, err_len, "out of memory");
+        return false;
+    }
+
+    size_t n = txn_commit(txn, names, catalog->count);
+
+    for (size_t i = 0; i < n; i++) {
+        int idx = catalog_find(catalog, names[i]);
+        if (idx < 0) continue;
+        if (!catalog->tables[idx].path) continue;
+        if (!dump_csv(&catalog->tables[idx].table, catalog->tables[idx].path)) {
+            snprintf(err, err_len, "commit failed: could not durably write \"%s\"", names[i]);
+            free(names);
+            return false;
+        }
+    }
+
+    free(names);
+    return true;
+}
+
+/* Dispatches to the right mutation, wrapping it in an implicit BEGIN/COMMIT
+ * (or ROLLBACK on failure) when no explicit transaction is already open -
+ * autocommit runs silently (no BEGIN/COMMIT feedback), it's the same
+ * durability guarantee either way. */
+bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+    switch (stmt->kind) {
+        case STMT_SELECT:
+            return interp_exec_select(&stmt->as.select, catalog, out, err, err_len);
+        case STMT_BEGIN:
+            if (!txn_begin(txn, err, err_len)) return false;
+            fprintf(out, "BEGIN\n");
+            return true;
+        case STMT_COMMIT:
+            if (!interp_exec_commit(catalog, txn, err, err_len)) return false;
+            fprintf(out, "COMMIT\n");
+            return true;
+        case STMT_ROLLBACK:
+            if (!txn->active) {
+                snprintf(err, err_len, "no transaction is active");
+                return false;
+            }
+            txn_rollback(txn);
+            fprintf(out, "ROLLBACK\n");
+            return true;
+        case STMT_INSERT:
+        case STMT_UPDATE:
+        case STMT_DELETE: {
+            bool autocommit = !txn->active;
+            if (autocommit) {
+                char begin_err[128];
+                if (!txn_begin(txn, begin_err, sizeof begin_err)) {
+                    snprintf(err, err_len, "%s", begin_err);
+                    return false;
+                }
+            }
+
+            bool ok = stmt->kind == STMT_INSERT ? interp_exec_insert(&stmt->as.insert, catalog, txn, out, err, err_len)
+                    : stmt->kind == STMT_UPDATE ? interp_exec_update(&stmt->as.update, catalog, txn, out, err, err_len)
+                                                 : interp_exec_delete(&stmt->as.del, catalog, txn, out, err, err_len);
+
+            if (autocommit) {
+                if (ok) {
+                    ok = interp_exec_commit(catalog, txn, err, err_len);
+                } else {
+                    txn_rollback(txn);
+                }
+            }
+            return ok;
+        }
+    }
+    snprintf(err, err_len, "internal error: unknown statement kind");
+    return false;
 }

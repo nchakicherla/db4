@@ -78,17 +78,12 @@ static Expr *parse_string_literal(Parser *p) {
     return e;
 }
 
-static Expr *parse_primary(Parser *p) {
-    if (p->failed) return NULL;
-
+/* Tries to build a literal from the current token; returns NULL without
+ * failing the parser if it isn't one - callers decide what "not a
+ * literal" means in their context (a general expression vs. INSERT/UPDATE's
+ * literal-only grammar want different error messages). */
+static Expr *make_literal_from_token(Parser *p) {
     switch (p->cur.type) {
-        case TOK_IDENT: {
-            Expr *e = new_expr(p, EXPR_COLUMN);
-            if (!e) return NULL;
-            e->as.column = arena_strndup(p->arena, p->cur.start, p->cur.len);
-            advance(p);
-            return e;
-        }
         case TOK_INT: {
             Expr *e = new_expr(p, EXPR_LIT_INT);
             if (!e) return NULL;
@@ -121,6 +116,33 @@ static Expr *parse_primary(Parser *p) {
             advance(p);
             return e;
         }
+        default:
+            return NULL;
+    }
+}
+
+/* INSERT ... VALUES (...) and UPDATE ... SET col = ... both take a literal
+ * only - there's no arithmetic yet to make a general expression meaningful
+ * there. */
+static Expr *parse_literal(Parser *p) {
+    if (p->failed) return NULL;
+    Expr *e = make_literal_from_token(p);
+    if (e) return e;
+    parser_fail(p, p->cur.line, "expected a literal value but found %s", token_type_name(p->cur.type));
+    return NULL;
+}
+
+static Expr *parse_primary(Parser *p) {
+    if (p->failed) return NULL;
+
+    switch (p->cur.type) {
+        case TOK_IDENT: {
+            Expr *e = new_expr(p, EXPR_COLUMN);
+            if (!e) return NULL;
+            e->as.column = arena_strndup(p->arena, p->cur.start, p->cur.len);
+            advance(p);
+            return e;
+        }
         case TOK_LPAREN: {
             advance(p);
             Expr *inner = parse_or(p);
@@ -129,9 +151,12 @@ static Expr *parse_primary(Parser *p) {
             advance(p);
             return inner;
         }
-        default:
+        default: {
+            Expr *e = make_literal_from_token(p);
+            if (e) return e;
             parser_fail(p, p->cur.line, "expected an expression but found %s", token_type_name(p->cur.type));
             return NULL;
+        }
     }
 }
 
@@ -329,6 +354,216 @@ SelectStmt *parser_parse_select(Parser *p) {
     return stmt;
 }
 
+static InsertStmt parse_insert_stmt(Parser *p) {
+    InsertStmt stmt = {0};
+
+    if (!expect(p, TOK_INSERT, "INSERT")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_INTO, "INTO")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_IDENT, "a table name")) return stmt;
+    stmt.table = arena_strndup(p->arena, p->cur.start, p->cur.len);
+    advance(p);
+
+    if (p->cur.type == TOK_LPAREN) {
+        advance(p);
+        size_t cap = 4, count = 0;
+        char **names = arena_alloc(p->arena, cap * sizeof(char *), _Alignof(char *));
+        if (!names) {
+            parser_fail(p, p->cur.line, "out of memory");
+            return stmt;
+        }
+        for (;;) {
+            if (!expect(p, TOK_IDENT, "a column name")) return stmt;
+            if (count == cap) {
+                size_t new_cap = cap * 2;
+                char **grown = arena_grow(p->arena, names, cap * sizeof(char *),
+                                           new_cap * sizeof(char *), _Alignof(char *));
+                if (!grown) {
+                    parser_fail(p, p->cur.line, "out of memory");
+                    return stmt;
+                }
+                names = grown;
+                cap   = new_cap;
+            }
+            names[count++] = arena_strndup(p->arena, p->cur.start, p->cur.len);
+            advance(p);
+            if (p->cur.type != TOK_COMMA) break;
+            advance(p);
+        }
+        if (!expect(p, TOK_RPAREN, ")")) return stmt;
+        advance(p);
+        stmt.columns   = names;
+        stmt.n_columns = count;
+    }
+
+    if (!expect(p, TOK_VALUES, "VALUES")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_LPAREN, "(")) return stmt;
+    advance(p);
+
+    size_t vcap = 4, vcount = 0;
+    Expr **values = arena_alloc(p->arena, vcap * sizeof(Expr *), _Alignof(Expr *));
+    if (!values) {
+        parser_fail(p, p->cur.line, "out of memory");
+        return stmt;
+    }
+    for (;;) {
+        Expr *v = parse_literal(p);
+        if (p->failed) return stmt;
+        if (vcount == vcap) {
+            size_t new_cap = vcap * 2;
+            Expr **grown = arena_grow(p->arena, values, vcap * sizeof(Expr *),
+                                       new_cap * sizeof(Expr *), _Alignof(Expr *));
+            if (!grown) {
+                parser_fail(p, p->cur.line, "out of memory");
+                return stmt;
+            }
+            values = grown;
+            vcap   = new_cap;
+        }
+        values[vcount++] = v;
+        if (p->cur.type != TOK_COMMA) break;
+        advance(p);
+    }
+    if (!expect(p, TOK_RPAREN, ")")) return stmt;
+    advance(p);
+
+    stmt.values   = values;
+    stmt.n_values = vcount;
+    return stmt;
+}
+
+static UpdateStmt parse_update_stmt(Parser *p) {
+    UpdateStmt stmt = {0};
+
+    if (!expect(p, TOK_UPDATE, "UPDATE")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_IDENT, "a table name")) return stmt;
+    stmt.table = arena_strndup(p->arena, p->cur.start, p->cur.len);
+    advance(p);
+
+    if (!expect(p, TOK_SET, "SET")) return stmt;
+    advance(p);
+
+    size_t cap = 4, count = 0;
+    Assignment *assigns = arena_alloc(p->arena, cap * sizeof(Assignment), _Alignof(Assignment));
+    if (!assigns) {
+        parser_fail(p, p->cur.line, "out of memory");
+        return stmt;
+    }
+    for (;;) {
+        if (!expect(p, TOK_IDENT, "a column name")) return stmt;
+        char *col = arena_strndup(p->arena, p->cur.start, p->cur.len);
+        advance(p);
+        if (!expect(p, TOK_EQ, "=")) return stmt;
+        advance(p);
+        Expr *val = parse_literal(p);
+        if (p->failed) return stmt;
+
+        if (count == cap) {
+            size_t new_cap = cap * 2;
+            Assignment *grown = arena_grow(p->arena, assigns, cap * sizeof(Assignment),
+                                            new_cap * sizeof(Assignment), _Alignof(Assignment));
+            if (!grown) {
+                parser_fail(p, p->cur.line, "out of memory");
+                return stmt;
+            }
+            assigns = grown;
+            cap     = new_cap;
+        }
+        assigns[count].column = col;
+        assigns[count].value  = val;
+        count++;
+
+        if (p->cur.type != TOK_COMMA) break;
+        advance(p);
+    }
+
+    stmt.assignments   = assigns;
+    stmt.n_assignments = count;
+
+    if (p->cur.type == TOK_WHERE) {
+        advance(p);
+        stmt.where = parse_or(p);
+        if (p->failed) return stmt;
+    }
+    return stmt;
+}
+
+static DeleteStmt parse_delete_stmt(Parser *p) {
+    DeleteStmt stmt = {0};
+
+    if (!expect(p, TOK_DELETE, "DELETE")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_FROM, "FROM")) return stmt;
+    advance(p);
+    if (!expect(p, TOK_IDENT, "a table name")) return stmt;
+    stmt.table = arena_strndup(p->arena, p->cur.start, p->cur.len);
+    advance(p);
+
+    if (p->cur.type == TOK_WHERE) {
+        advance(p);
+        stmt.where = parse_or(p);
+        if (p->failed) return stmt;
+    }
+    return stmt;
+}
+
+Stmt *parser_parse_statement(Parser *p) {
+    if (p->failed) return NULL;
+
+    Stmt *stmt = arena_alloc_type(p->arena, Stmt);
+    if (!stmt) {
+        parser_fail(p, p->cur.line, "out of memory");
+        return NULL;
+    }
+
+    switch (p->cur.type) {
+        case TOK_SELECT: {
+            SelectStmt *sel = parser_parse_select(p);
+            if (p->failed) return NULL;
+            stmt->kind      = STMT_SELECT;
+            stmt->as.select = *sel;
+            return stmt;
+        }
+        case TOK_INSERT:
+            stmt->kind      = STMT_INSERT;
+            stmt->as.insert = parse_insert_stmt(p);
+            break;
+        case TOK_UPDATE:
+            stmt->kind      = STMT_UPDATE;
+            stmt->as.update = parse_update_stmt(p);
+            break;
+        case TOK_DELETE:
+            stmt->kind   = STMT_DELETE;
+            stmt->as.del = parse_delete_stmt(p);
+            break;
+        case TOK_BEGIN:
+            advance(p);
+            if (p->cur.type == TOK_TRANSACTION) advance(p);
+            stmt->kind = STMT_BEGIN;
+            break;
+        case TOK_COMMIT:
+            advance(p);
+            stmt->kind = STMT_COMMIT;
+            break;
+        case TOK_ROLLBACK:
+            advance(p);
+            stmt->kind = STMT_ROLLBACK;
+            break;
+        default:
+            parser_fail(p, p->cur.line, "expected a statement but found %s", token_type_name(p->cur.type));
+            return NULL;
+    }
+
+    if (p->failed) return NULL;
+    if (p->cur.type == TOK_SEMICOLON) advance(p);
+    if (!expect(p, TOK_EOF, "end of statement")) return NULL;
+
+    return stmt;
+}
+
 bool parser_failed(const Parser *p) { return p->failed; }
 const char *parser_error(const Parser *p) { return p->err; }
 size_t parser_error_line(const Parser *p) { return p->err_line; }
@@ -399,4 +634,59 @@ void select_stmt_print(FILE *f, const SelectStmt *stmt) {
         fprintf(f, " limit %lld", (long long)stmt->limit);
     }
     fprintf(f, "\n");
+}
+
+void stmt_print(FILE *f, const Stmt *stmt) {
+    switch (stmt->kind) {
+        case STMT_SELECT:
+            select_stmt_print(f, &stmt->as.select);
+            return;
+        case STMT_INSERT: {
+            const InsertStmt *s = &stmt->as.insert;
+            fprintf(f, "insert into %s", s->table);
+            if (s->columns) {
+                fprintf(f, " (");
+                for (size_t i = 0; i < s->n_columns; i++) {
+                    if (i) fprintf(f, ", ");
+                    fprintf(f, "%s", s->columns[i]);
+                }
+                fprintf(f, ")");
+            }
+            fprintf(f, " values (");
+            for (size_t i = 0; i < s->n_values; i++) {
+                if (i) fprintf(f, ", ");
+                print_expr(f, s->values[i]);
+            }
+            fprintf(f, ")\n");
+            return;
+        }
+        case STMT_UPDATE: {
+            const UpdateStmt *s = &stmt->as.update;
+            fprintf(f, "update %s set ", s->table);
+            for (size_t i = 0; i < s->n_assignments; i++) {
+                if (i) fprintf(f, ", ");
+                fprintf(f, "%s = ", s->assignments[i].column);
+                print_expr(f, s->assignments[i].value);
+            }
+            if (s->where) {
+                fprintf(f, " where ");
+                print_expr(f, s->where);
+            }
+            fprintf(f, "\n");
+            return;
+        }
+        case STMT_DELETE: {
+            const DeleteStmt *s = &stmt->as.del;
+            fprintf(f, "delete from %s", s->table);
+            if (s->where) {
+                fprintf(f, " where ");
+                print_expr(f, s->where);
+            }
+            fprintf(f, "\n");
+            return;
+        }
+        case STMT_BEGIN:    fprintf(f, "begin\n");    return;
+        case STMT_COMMIT:   fprintf(f, "commit\n");   return;
+        case STMT_ROLLBACK: fprintf(f, "rollback\n"); return;
+    }
 }

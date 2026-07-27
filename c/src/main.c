@@ -8,6 +8,7 @@
 #include "interp.h"
 #include "parser.h"
 #include "table.h"
+#include "txn.h"
 
 static const char *skip_spaces(const char *s) {
     while (*s == ' ') s++;
@@ -78,9 +79,9 @@ static void cmd_schema(Catalog *catalog, const char *args) {
     print_schema(&catalog->tables[idx].table);
 }
 
-/* Lexes and parses a SELECT statement and prints the resulting AST -
- * there's no executor yet (M4), so this is M3's own way of standing on
- * its own: proof the grammar works without waiting for execution. */
+/* Lexes and parses any statement and prints the resulting AST without
+ * running it - lets the grammar be exercised (including INSERT/UPDATE/
+ * DELETE/BEGIN/COMMIT/ROLLBACK as of M5) independently of execution. */
 static void cmd_parse(const char *args) {
     Arena arena;
     arena_init(&arena);
@@ -88,25 +89,27 @@ static void cmd_parse(const char *args) {
     Parser parser;
     parser_init(&parser, args, strlen(args), &arena);
 
-    SelectStmt *stmt = parser_parse_select(&parser);
+    Stmt *stmt = parser_parse_statement(&parser);
     if (parser_failed(&parser)) {
         printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
     } else {
-        select_stmt_print(stdout, stmt);
+        stmt_print(stdout, stmt);
     }
 
     arena_term(&arena);
 }
 
-/* A bare (non-dot) line is SQL: M4's executor runs it against catalog. */
-static void cmd_sql(Catalog *catalog, const char *line) {
+/* A bare (non-dot) line is SQL, run against catalog. A mutating statement
+ * (INSERT/UPDATE/DELETE) with no transaction already open runs as its own
+ * autocommit transaction - see interp_exec. */
+static void cmd_sql(Catalog *catalog, Txn *txn, const char *line) {
     Arena arena;
     arena_init(&arena);
 
     Parser parser;
     parser_init(&parser, line, strlen(line), &arena);
 
-    SelectStmt *stmt = parser_parse_select(&parser);
+    Stmt *stmt = parser_parse_statement(&parser);
     if (parser_failed(&parser)) {
         printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
         arena_term(&arena);
@@ -114,7 +117,7 @@ static void cmd_sql(Catalog *catalog, const char *line) {
     }
 
     char err[128];
-    if (!interp_exec_select(stmt, catalog, stdout, err, sizeof err))
+    if (!interp_exec(stmt, catalog, txn, stdout, err, sizeof err))
         printf("%s\n", err);
 
     arena_term(&arena);
@@ -140,6 +143,8 @@ int main(void) {
     linenoiseHistorySetMaxLen(100);
 
     Catalog catalog = {0};
+    Txn     txn;
+    txn_init(&txn);
 
     char *line;
     while ((line = linenoise("db4> ")) != NULL) {
@@ -158,11 +163,12 @@ int main(void) {
         if (line[0] == '.') {
             dispatch(&catalog, line);
         } else {
-            cmd_sql(&catalog, line);
+            cmd_sql(&catalog, &txn, line);
         }
         linenoiseFree(line);
     }
 
+    txn_term(&txn);
     catalog_term(&catalog);
     return 0;
 }

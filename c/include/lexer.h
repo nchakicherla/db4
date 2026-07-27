@@ -27,6 +27,17 @@ typedef enum {
     TOK_TRUE,
     TOK_FALSE,
 
+    TOK_INSERT,
+    TOK_INTO,
+    TOK_VALUES,
+    TOK_UPDATE,
+    TOK_SET,
+    TOK_DELETE,
+    TOK_BEGIN,
+    TOK_COMMIT,
+    TOK_ROLLBACK,
+    TOK_TRANSACTION,
+
     TOK_STAR,
     TOK_COMMA,
     TOK_SEMICOLON,

@@ -267,6 +267,14 @@ void table_delete_row(Table *t, size_t row) {
     t->n_dead++;
 }
 
+/* Undoes table_delete_row - used by txn.c to roll back a DELETE, not part
+ * of any SQL-visible operation. */
+void table_undelete_row(Table *t, size_t row) {
+    if (!dead_test(t, row)) return;
+    dead_clear(t, row);
+    t->n_dead--;
+}
+
 bool table_row_is_dead(const Table *t, size_t row) {
     return dead_test(t, row);
 }

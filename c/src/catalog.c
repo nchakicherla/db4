@@ -18,10 +18,12 @@ int catalog_find(const Catalog *c, const char *name) {
     return -1;
 }
 
-Table *catalog_put(Catalog *c, const char *name) {
+Table *catalog_put(Catalog *c, const char *name, const char *path) {
     int idx = catalog_find(c, name);
     if (idx >= 0) {
         table_term(&c->tables[idx].table);
+        free(c->tables[idx].path);
+        c->tables[idx].path = path ? dup_name(path) : NULL;
         return &c->tables[idx].table;
     }
 
@@ -37,7 +39,11 @@ Table *catalog_put(Catalog *c, const char *name) {
     char *dup = dup_name(name);
     if (!dup) return NULL;
 
+    char *path_dup = path ? dup_name(path) : NULL;
+    if (path && !path_dup) return NULL;
+
     c->tables[c->count].name = dup;
+    c->tables[c->count].path = path_dup;
     return &c->tables[c->count++].table;
 }
 
@@ -45,6 +51,7 @@ void catalog_term(Catalog *c) {
     for (size_t i = 0; i < c->count; i++) {
         table_term(&c->tables[i].table);
         free(c->tables[i].name);
+        free(c->tables[i].path);
     }
     free(c->tables);
     c->tables = NULL;

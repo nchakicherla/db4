@@ -25,6 +25,11 @@ executed loosely.
 - **Storage**: CSV-backed tables, column-oriented in memory (fixed-width
   types inline, TEXT in an append-only heap), tombstone deletes, one
   primary key (hash-indexed) and foreign key declarations per table.
+- **Query execution**: a tree-walking interpreter, no bytecode or planner.
+  `WHERE`/`JOIN ... ON` equality against a primary key is accelerated via
+  that same hash index - an O(1) point lookup instead of a full scan, or
+  a hash-probe instead of a nested-loop scan for a join on a primary key
+  - everything else (ranges, non-PK columns) is a straightforward scan.
 - **SQL surface**:
   - `SELECT` - `*` or explicit column projection, `WHERE` with
     `AND`/`OR`/`NOT`/parens and three-valued (`true`/`false`/unknown) NULL
@@ -90,11 +95,35 @@ Dot-commands (talk to the table catalog directly, no SQL equivalent):
 | `.dump <table> "<path>"` | Write a table back out to CSV |
 | `.checkpoint <table>` | Fold the table's WAL back into its base CSV |
 | `.parse <sql>` | Parse `<sql>` and print the AST, without executing it |
+| `.cd "<path>"` | Change the working directory |
+| `.ls ["<path>"]` | List a directory's entries (default: the current directory) |
+| `.read "<path>"` | Run another file's lines through the current session |
 | `.quit` / `.exit` | Exit the REPL |
 
 Any other input is parsed and executed as SQL through the public API
 (`db4_prepare`/`db4_step`/`db4_column_*`), the same path any embedding
 application uses.
+
+Tab completion covers dot-command names, filenames inside a quoted path
+argument (`.load`/`.dump`/`.cd`/`.ls`/`.read`), and SQL keywords/table/
+column names elsewhere - the keyword list is read from the lexer's own
+table, and table/column names come from whatever's currently loaded.
+
+## Running a script
+
+```bash
+bin/main myscript.sql
+```
+
+Runs `myscript.sql`'s lines exactly like piped stdin already does, but
+stops at the first failure and exits non-zero - the same convention
+`sqlite3`'s own CLI uses for non-interactive input, so a script's failure
+is actually visible to whatever ran it (a shell, CI). A plain interactive
+or piped session (no script argument) keeps printing an error and moving
+on instead, since a REPL shouldn't die because one statement failed.
+`.read "<path>"` runs a file the same way from inside an existing
+session; a `.quit`/`.exit` reached inside it exits the whole program, not
+just that file.
 
 ## C API overview
 

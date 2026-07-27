@@ -12,12 +12,20 @@ static char *dup_str(const char *s) {
 }
 
 bool result_set_init(ResultSet *rs, size_t n_cols) {
+    char **col_names = n_cols ? calloc(n_cols, sizeof(char *)) : NULL;
+    if (n_cols && !col_names) {
+        /* n_cols left at 0 (not the requested count) so result_set_free
+         * - which loops "for i < n_cols: free(col_names[i])" - never
+         * dereferences the NULL col_names a failed calloc left behind. */
+        *rs = (ResultSet){0};
+        return false;
+    }
     rs->n_cols    = n_cols;
-    rs->col_names = n_cols ? calloc(n_cols, sizeof(char *)) : NULL;
+    rs->col_names = col_names;
     rs->cells     = NULL;
     rs->n_rows    = 0;
     rs->row_cap   = 0;
-    return n_cols == 0 || rs->col_names != NULL;
+    return true;
 }
 
 bool result_set_set_col_name(ResultSet *rs, size_t idx, const char *name) {

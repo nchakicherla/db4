@@ -38,21 +38,21 @@ bool txn_begin(Txn *txn, char *err, size_t err_len) {
     return true;
 }
 
-bool txn_log_insert(Txn *txn, Table *table, const char *table_name, size_t row) {
+bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, size_t row) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_INSERT;
-    e->table      = table;
+    e->table_idx  = table_idx;
     e->table_name = table_name;
     e->row        = row;
     return true;
 }
 
-bool txn_log_update(Txn *txn, Table *table, const char *table_name, size_t row, size_t col) {
+bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, size_t row, size_t col) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_UPDATE;
-    e->table      = table;
+    e->table_idx  = table_idx;
     e->table_name = table_name;
     e->row        = row;
     e->col        = col;
@@ -71,42 +71,49 @@ bool txn_log_update(Txn *txn, Table *table, const char *table_name, size_t row, 
     return true;
 }
 
-bool txn_log_delete(Txn *txn, Table *table, const char *table_name, size_t row) {
+bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, size_t row) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_DELETE;
-    e->table      = table;
+    e->table_idx  = table_idx;
     e->table_name = table_name;
     e->row        = row;
     return true;
 }
 
-static void undo_one(const UndoEntry *e) {
+static void undo_one(const UndoEntry *e, Catalog *catalog) {
+    Table *table = &catalog->tables[e->table_idx].table;
     switch (e->kind) {
         case UNDO_INSERT:
-            table_delete_row(e->table, e->row);
+            table_delete_row(table, e->row);
             return;
         case UNDO_DELETE:
-            table_undelete_row(e->table, e->row);
+            table_undelete_row(table, e->row);
             return;
         case UNDO_UPDATE:
             if (e->was_null) {
-                table_set_null(e->table, e->row, e->col);
+                table_set_null(table, e->row, e->col);
                 return;
             }
             switch (e->type) {
-                case FT_INT:    table_set_int(e->table, e->row, e->col, e->old.i); return;
-                case FT_DOUBLE: table_set_double(e->table, e->row, e->col, e->old.d); return;
-                case FT_BOOL:   table_set_bool(e->table, e->row, e->col, e->old.b); return;
-                case FT_TEXT:   table_set_text_ref(e->table, e->row, e->col, e->old.s); return;
+                case FT_INT:    table_set_int(table, e->row, e->col, e->old.i); return;
+                case FT_DOUBLE: table_set_double(table, e->row, e->col, e->old.d); return;
+                case FT_BOOL:   table_set_bool(table, e->row, e->col, e->old.b); return;
+                case FT_TEXT:   table_set_text_ref(table, e->row, e->col, e->old.s); return;
                 default: return;
             }
     }
 }
 
-void txn_rollback(Txn *txn) {
+void txn_rollback(Txn *txn, Catalog *catalog) {
     for (size_t i = txn->count; i > 0; i--)
-        undo_one(&txn->log[i - 1]);
+        undo_one(&txn->log[i - 1], catalog);
     txn->count  = 0;
     txn->active = false;
+}
+
+void txn_rollback_to(Txn *txn, Catalog *catalog, size_t mark) {
+    for (size_t i = txn->count; i > mark; i--)
+        undo_one(&txn->log[i - 1], catalog);
+    txn->count = mark;
 }

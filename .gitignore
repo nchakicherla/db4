@@ -3,4 +3,6 @@ c/bin/
 c/tests/tmp/
 c/tests/__pycache__/
 *.lock
+*.gen
 .DS_Store
+bugs.md

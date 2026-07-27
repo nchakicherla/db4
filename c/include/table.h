@@ -47,6 +47,16 @@ typedef struct {
     int      pk_col;
     RowIndex pk_index;
 
+    /* The <path>.gen sidecar's value as of this table's last .load (0 if
+     * never checkpointed, or not backed by a file at all - see load.c and
+     * wal.c's wal_checkpoint/wal_read_generation). interp.c's commit path
+     * compares this against the file's *current* value before appending a
+     * WAL frame - a mismatch means some other process compacted (and so
+     * renumbered) the base CSV via .checkpoint since this table was loaded
+     * here, which would otherwise make this process's next commit describe
+     * the wrong row to whoever replays the WAL later. */
+    uint32_t wal_generation;
+
     Arena arena;
 } Table;
 

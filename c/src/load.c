@@ -12,6 +12,7 @@
 #include "field.h"
 #include "lock.h"
 #include "schema.h"
+#include "value.h"
 #include "wal.h"
 
 #define LOAD_ARENA_RESERVE ((size_t)8 * ARENA_BLOCK_SIZE)
@@ -20,9 +21,13 @@ static void usage_load(void) {
     printf("usage: .load <name> \"<path>\" [{\"col\":\"type\",...} | \"<schema.json>\"]\n");
 }
 
-static void set_cell(Table *t, size_t row, size_t col, const char *field) {
+/* Returns false (leaving the cell NULL, its table_append_row default)
+ * without setting anything when field doesn't validate against type -
+ * load_row counts these so load_csv can warn instead of reporting a clean
+ * load that quietly dropped data (see load_row/load_csv). */
+static bool set_cell(Table *t, size_t row, size_t col, const char *field) {
     FieldType type = t->types[col];
-    if (!field_validate(field, type)) return;
+    if (!field_validate(field, type)) return false;
 
     switch (type) {
         case FT_INT:    table_set_int(t, row, col, strtoll(field, NULL, 10)); break;
@@ -31,6 +36,7 @@ static void set_cell(Table *t, size_t row, size_t col, const char *field) {
         case FT_TEXT:   table_set_text(t, row, col, field, strlen(field)); break;
         default: break;
     }
+    return true;
 }
 
 static bool check_primary_key(const Table *t, size_t row, size_t col) {
@@ -66,14 +72,14 @@ static bool check_row_constraints(Table *t, size_t row, Table *const *fk_ref_tab
     return true;
 }
 
-static size_t load_row(Table *t, const CsvRow *row) {
+static size_t load_row(Table *t, const CsvRow *row, size_t *out_coerced) {
     size_t n = row->count < t->n_cols ? row->count : t->n_cols;
     size_t r = table_append_row(t);
     if (r == SIZE_MAX) return SIZE_MAX;
 
     for (size_t i = 0; i < n; i++) {
         if (row->fields[i][0] == '\0' && !row->quoted[i]) continue;
-        set_cell(t, r, i, row->fields[i]);
+        if (!set_cell(t, r, i, row->fields[i])) (*out_coerced)++;
     }
     return table_failed(t) ? SIZE_MAX : r;
 }
@@ -159,7 +165,7 @@ static bool read_file(const char *path, size_t reserve, char **out_data, size_t 
     return true;
 }
 
-bool load_csv(Catalog *catalog, const char *args) {
+bool load_csv(Catalog *catalog, bool txn_active, const char *args) {
     char name[64];
     int  name_consumed = 0;
     if (sscanf(args, "%63s%n", name, &name_consumed) != 1) {
@@ -168,6 +174,12 @@ bool load_csv(Catalog *catalog, const char *args) {
     }
     args += name_consumed;
     while (*args == ' ') args++;
+
+    if (txn_active && catalog_find(catalog, name) >= 0) {
+        printf("cannot .load over table \"%s\" while a transaction is open "
+               "(COMMIT or ROLLBACK first)\n", name);
+        return false;
+    }
 
     char path[4096];
     if (*args != '"' || !read_quoted(&args, path, sizeof path)) {
@@ -199,10 +211,20 @@ bool load_csv(Catalog *catalog, const char *args) {
 
     /* A brief shared (reader) lock around the read + WAL replay below -
      * see lock.h. Concurrent readers can hold this together; it excludes
-     * only a writer mid-checkpoint (M7). */
+     * only a writer mid-checkpoint (M7). Unlike a commit or a checkpoint
+     * (both writes - see interp.c's commit_wal_for_table and main.c's
+     * cmd_checkpoint, which refuse outright without their lock), failing
+     * to get this one only risks *this* read racing a concurrent writer's
+     * WAL append or checkpoint - reading a torn snapshot, not corrupting
+     * anything on disk - so a load proceeds anyway rather than refusing a
+     * table entirely over what's still just an advisory, best-effort
+     * lock. */
     Db4Lock lock;
     lock.fd = -1;
     bool have_lock = db4_lock_open(&lock, path) && db4_lock_shared(&lock);
+    if (!have_lock)
+        printf("warning: could not acquire a shared lock on %s; reading without one - "
+               "a concurrent writer's commit or checkpoint could be observed mid-write\n", path);
 
     if (!read_file(path, LOAD_ARENA_RESERVE, &data, &n_read)) {
         if (have_lock) db4_lock_release(&lock);
@@ -337,8 +359,14 @@ bool load_csv(Catalog *catalog, const char *args) {
         }
         if (status == CSV_NOMEM) goto oom;
         if (status == CSV_ERR) {
+            /* Every CSV_ERR (a bad quote, an oversized field, or - unlike
+             * those - a row whose column count doesn't match the header,
+             * which can still have first.count > 0) names a row that
+             * isn't usable data - always move on to the next one rather
+             * than falling through to load a malformed row just because
+             * this particular error happened to leave some fields parsed. */
             printf("line %zu: %s\n", csv_reader_error_line(&reader), csv_reader_error(&reader));
-            if (first.count == 0) continue;
+            continue;
         }
         break;
     }
@@ -374,7 +402,8 @@ bool load_csv(Catalog *catalog, const char *args) {
     if (table_failed(&new_table)) goto oom;
     arena_term(&schema_arena);
 
-    size_t r = load_row(&new_table, &first);
+    size_t n_coerced = 0;
+    size_t r = load_row(&new_table, &first, &n_coerced);
     if (r == SIZE_MAX) goto oom;
     if (!check_row_constraints(&new_table, r, fk_ref_table, fk_ref_col)) goto fail;
     size_t n_loaded = 1;
@@ -385,10 +414,15 @@ bool load_csv(Catalog *catalog, const char *args) {
         if (status == CSV_EOF) break;
         if (status == CSV_NOMEM) goto oom;
         if (status == CSV_ERR) {
+            /* See the identical comment on the first-row loop above - a
+             * wrong-column-count row can have row.count > 0 despite being
+             * unusable, so this always skips rather than falling through
+             * to load_row (which would otherwise silently truncate/pad it
+             * into the table instead of the row being skipped as reported). */
             printf("line %zu: %s\n", csv_reader_error_line(&reader), csv_reader_error(&reader));
-            if (row.count == 0) continue;
+            continue;
         }
-        size_t rr = load_row(&new_table, &row);
+        size_t rr = load_row(&new_table, &row, &n_coerced);
         if (rr == SIZE_MAX) goto oom;
         if (!check_row_constraints(&new_table, rr, fk_ref_table, fk_ref_col)) goto fail;
         n_loaded++;
@@ -401,6 +435,14 @@ bool load_csv(Catalog *catalog, const char *args) {
             printf("warning: WAL replay for %s failed; continuing with base data only\n", wal_path);
     }
 
+    /* Remembers the checkpoint generation this table was loaded at, so a
+     * later commit from this same process can tell whether some other
+     * process has since .checkpoint'd (and so row-renumbered) this table
+     * out from under it - see wal_checkpoint and interp.c's
+     * commit_wal_for_table. */
+    uint32_t gen;
+    if (wal_read_generation(path, &gen)) new_table.wal_generation = gen;
+
     Table *slot = catalog_put(catalog, name, path);
     if (!slot) goto oom;
     *slot = new_table;
@@ -408,6 +450,10 @@ bool load_csv(Catalog *catalog, const char *args) {
     printf("loaded %zu row%s into %zu column%s from %s as %s\n",
            n_loaded, n_loaded == 1 ? "" : "s",
            header.count, header.count == 1 ? "" : "s", path, name);
+    if (n_coerced > 0)
+        printf("warning: %zu value%s did not match %s column's type and %s left NULL\n",
+               n_coerced, n_coerced == 1 ? "" : "s",
+               n_coerced == 1 ? "its" : "their", n_coerced == 1 ? "was" : "were");
 
     csv_reader_free(&reader);
     arena_term(&csv_arena);
@@ -463,7 +509,7 @@ static bool dump_cell(FILE *f, const Table *t, size_t row, size_t col) {
             snprintf(buf, sizeof buf, "%lld", (long long)table_get_int(t, row, col));
             return write_csv_field(f, buf, strlen(buf));
         case FT_DOUBLE:
-            snprintf(buf, sizeof buf, "%g", table_get_double(t, row, col));
+            format_double(buf, sizeof buf, table_get_double(t, row, col));
             return write_csv_field(f, buf, strlen(buf));
         case FT_BOOL:
             return write_csv_field(f, table_get_bool(t, row, col) ? "true" : "false",

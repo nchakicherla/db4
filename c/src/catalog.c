@@ -40,7 +40,10 @@ Table *catalog_put(Catalog *c, const char *name, const char *path) {
     if (!dup) return NULL;
 
     char *path_dup = path ? dup_name(path) : NULL;
-    if (path && !path_dup) return NULL;
+    if (path && !path_dup) {
+        free(dup);
+        return NULL;
+    }
 
     c->tables[c->count].name = dup;
     c->tables[c->count].path = path_dup;

@@ -291,7 +291,15 @@ static Value eval_value(const Expr *e, const RowCtx *ctx) {
         case EXPR_NEG: {
             Value v = eval_value(e->as.unary_operand, ctx);
             if (v.is_null) return v;
-            return v.kind == FT_INT ? value_int(-v.as.i) : value_double(-v.as.d);
+            /* -INT64_MIN can't be represented in int64_t - plain "-v.as.i"
+             * is undefined behavior for that one value (see the binary
+             * add/sub/mul case below for the same class of problem and why
+             * this codebase computes it in the unsigned domain instead: that
+             * wraps by a well-defined modular rule that happens to compute
+             * the exact same two's-complement bit pattern the CPU's own
+             * negate instruction already would, rather than leaving the
+             * result to the compiler's own overflow assumptions at -O3). */
+            return v.kind == FT_INT ? value_int((int64_t)(0 - (uint64_t)v.as.i)) : value_double(-v.as.d);
         }
         case EXPR_NOT: {
             Tri t = eval_tri(e, ctx);
@@ -324,10 +332,31 @@ static Value eval_value(const Expr *e, const RowCtx *ctx) {
                     default:     return value_double(x * y);
                 }
             }
+            /* Plain "l.as.i + r.as.i" (etc.) is undefined behavior on
+             * overflow - not just a sanitizer complaint but a real
+             * miscompilation risk at -O3, which this codebase's own
+             * makefile uses (a compiler is entitled to assume signed
+             * overflow never happens and optimize on that basis). Doing
+             * the arithmetic in uint64_t instead is well-defined (unsigned
+             * arithmetic wraps modularly, by the standard's own rule) and
+             * then converting back to int64_t reproduces the exact same
+             * two's-complement bit pattern the CPU's native add/sub/mul
+             * already computes on every mainstream platform this runs on -
+             * so the *value* returned for an overflowing expression is
+             * unchanged from today's de-facto behavior, only its
+             * well-definedness changes. Widening to DOUBLE instead (the
+             * way OP_DIV above always does) isn't safe to do silently here
+             * the way it is for division: infer_expr_type's static type
+             * check has already committed this expression to ETYPE_INT for
+             * every caller (assign_value, in particular, trusts the
+             * Value's kind matches what was statically inferred and would
+             * misread a DOUBLE's bits as an int64_t through the union) -
+             * changing the runtime kind out from under that would be a
+             * different, worse bug than the one being fixed here. */
             switch (op) {
-                case OP_ADD: return value_int(l.as.i + r.as.i);
-                case OP_SUB: return value_int(l.as.i - r.as.i);
-                default:     return value_int(l.as.i * r.as.i);
+                case OP_ADD: return value_int((int64_t)((uint64_t)l.as.i + (uint64_t)r.as.i));
+                case OP_SUB: return value_int((int64_t)((uint64_t)l.as.i - (uint64_t)r.as.i));
+                default:     return value_int((int64_t)((uint64_t)l.as.i * (uint64_t)r.as.i));
             }
         }
         default: return value_null(FT_TEXT); /* unreachable */
@@ -464,11 +493,25 @@ static void assign_value(Table *t, size_t row, size_t col, Value v) {
  * candidate that gets filtered out downstream, never a missed real
  * match. ctx is only used for its params/n_params (a WHERE clause here
  * refers to exactly one table, and <const>'s definition already rules
- * out a column reference into it). */
-static bool find_pk_equality(const Expr *e, const RowCtx *ctx, const char *pk_name, Value *out) {
+ * out a column reference into it).
+ *
+ * pk_type gates one more thing the doc comment above doesn't cover:
+ * value_hash hashes a Value's raw representation, but compare_values (what
+ * the full WHERE re-check, and a non-indexed scan, both use) treats INT and
+ * DOUBLE as numerically comparable - value_int(5) and value_double(5.0)
+ * compare equal but hash completely differently. Without this check,
+ * "double_pk_col = 5" would hash the INT literal 5, probe for a slot that
+ * can only ever hold a DOUBLE's hash, and wrongly conclude there are no
+ * candidates at all - not a spurious candidate filtered out downstream
+ * (which the collision/staleness argument above handles), an outright
+ * missed match. Requiring the probe value's own kind to match the PK
+ * column's declared type exactly keeps the fast path representation-
+ * consistent; a cross-type comparison just skips it and falls back to the
+ * full scan, where compare_values's numeric coercion still applies. */
+static bool find_pk_equality(const Expr *e, const RowCtx *ctx, const char *pk_name, FieldType pk_type, Value *out) {
     if (e->kind == EXPR_BINARY && e->as.binary.op == OP_AND)
-        return find_pk_equality(e->as.binary.left, ctx, pk_name, out) ||
-               find_pk_equality(e->as.binary.right, ctx, pk_name, out);
+        return find_pk_equality(e->as.binary.left, ctx, pk_name, pk_type, out) ||
+               find_pk_equality(e->as.binary.right, ctx, pk_name, pk_type, out);
 
     if (e->kind != EXPR_BINARY || e->as.binary.op != OP_EQ) return false;
 
@@ -488,6 +531,7 @@ static bool find_pk_equality(const Expr *e, const RowCtx *ctx, const char *pk_na
 
     Value v = eval_value(const_side, ctx);
     if (v.is_null) return false; /* "pk = NULL" is never TRI_TRUE - nothing to look up */
+    if (v.kind != pk_type) return false; /* cross-type - see this function's doc comment */
     *out = v;
     return true;
 }
@@ -661,7 +705,8 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
     Value pk_lookup_value = value_null(FT_TEXT);
     bool  use_pk_lookup   = n_sources == 1 && tables[0]->pk_col >= 0 && stmt->where
                           && row_index_usable(&tables[0]->pk_index)
-                          && find_pk_equality(stmt->where, &static_ctx, tables[0]->names[tables[0]->pk_col], &pk_lookup_value);
+                          && find_pk_equality(stmt->where, &static_ctx, tables[0]->names[tables[0]->pk_col],
+                                              tables[0]->types[tables[0]->pk_col], &pk_lookup_value);
 
     if (use_pk_lookup) {
         /* Point lookup: probe the PK index instead of scanning every row.
@@ -737,7 +782,15 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
          * nested-loop fallback does, for the same reason find_pk_equality
          * documents for WHERE: the index only narrows candidates, so a
          * hash collision or stale entry can only cost a wasted check,
-         * never a wrong result. */
+         * never a wrong result.
+         *
+         * Eligibility also requires outer_key_expr's static type to match
+         * the inner PK column's declared type exactly - the same
+         * representation-vs-numeric-comparison gap find_pk_equality's doc
+         * comment covers for WHERE (value_hash hashes INT and DOUBLE
+         * differently even where compare_values treats them as equal), so
+         * a cross-type ON clause falls back to the nested-loop scan below
+         * instead of silently missing a true match. */
         const Expr *outer_key_expr = NULL;
         if (tables[filled]->pk_col >= 0 && row_index_usable(&tables[filled]->pk_index)) {
             outer_key_expr = find_join_pk_equality(stmt->joins[j].on, names[filled], tables[filled]->names[tables[filled]->pk_col]);
@@ -745,10 +798,13 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
                 RowSource outer_sources[MAX_JOIN_SOURCES];
                 for (size_t s = 0; s < filled; s++) outer_sources[s] = (RowSource){ names[s], tables[s], 0 };
                 RowCtx      outer_only_ctx = { outer_sources, filled, params, n_params };
-                ExprValueType discard_ty;
+                ExprValueType key_ty;
                 char           discard_err[64];
-                if (!infer_expr_type(outer_key_expr, &outer_only_ctx, &discard_ty, discard_err, sizeof discard_err))
+                FieldType      pk_type = tables[filled]->types[tables[filled]->pk_col];
+                if (!infer_expr_type(outer_key_expr, &outer_only_ctx, &key_ty, discard_err, sizeof discard_err))
                     outer_key_expr = NULL; /* references the inner table (or something else) - no fast path */
+                else if (key_ty != field_type_to_expr_type(pk_type))
+                    outer_key_expr = NULL; /* cross-type - see this block's doc comment */
             }
         }
 
@@ -870,7 +926,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
         g_sort_col   = order_col;
         g_sort_table = tables[order_src];
         g_sort_desc  = stmt->order_desc;
-        qsort(matched, n_matched, width * sizeof(size_t), join_sort_cmp);
+        if (n_matched) qsort(matched, n_matched, width * sizeof(size_t), join_sort_cmp); /* matched is NULL when n_matched == 0 */
     }
 
     size_t n_out = n_matched;
@@ -1076,6 +1132,19 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
             return false;
         }
         for (size_t i = 0; i < stmt->n_group_by; i++) {
+            /* GROUP BY is single-table-only, so the only qualifier that
+             * could ever mean anything here is the query's own FROM table -
+             * anything else (a typo, a table this query never mentions) is
+             * a real error, not something to silently accept and group by
+             * the bare column name anyway (see parser.c's GROUP BY parsing,
+             * which now keeps the qualifier instead of discarding it). */
+            const char *qual = stmt->group_by_table[i];
+            if (qual && strcmp(qual, stmt->table) != 0) {
+                snprintf(err, err_len, "no such table \"%s\" in query (GROUP BY %s.%s)",
+                         qual, qual, stmt->group_by[i]);
+                free(gb_cols);
+                return false;
+            }
             int col = table_find_column(t, stmt->group_by[i]);
             if (col < 0) {
                 snprintf(err, err_len, "no such column \"%s\" in table \"%s\"", stmt->group_by[i], stmt->table);
@@ -1170,6 +1239,7 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
 
     if (!result_set_init(out_rs, n_items) || !build_group_col_names(out_rs, stmt)) {
         snprintf(err, err_len, "out of memory");
+        result_set_free(out_rs); /* safe even if result_set_init itself is what failed */
         free(rows);
         goto fail;
     }
@@ -1269,48 +1339,68 @@ static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *tx
 
     RowCtx empty_ctx = { NULL, 0, params, n_params }; /* VALUES can't reference columns - see expr_has_column_ref below */
 
+    /* A multi-row VALUES list is one statement - a later row failing a
+     * check (bad value count, a disallowed column reference, a type
+     * mismatch, an out-of-memory append, or a constraint violation) must
+     * not leave earlier rows from *this same* INSERT applied while
+     * reporting the statement as failed. mark is this transaction's undo
+     * log length before any of this statement's rows are touched, so any
+     * failure below can cleanly unwind back to exactly that point via
+     * txn_rollback_to, without disturbing anything an earlier statement in
+     * the same still-open transaction already did. */
+    size_t mark = txn ? txn->count : 0;
+
     size_t n_inserted = 0;
     for (size_t r = 0; r < stmt->n_rows; r++) {
         const ValueRow *vr = &stmt->rows[r];
         if (vr->n_values != n_target) {
             snprintf(err, err_len, "row %zu: %zu value%s provided for %zu column%s",
                      r + 1, vr->n_values, vr->n_values == 1 ? "" : "s", n_target, n_target == 1 ? "" : "s");
-            free(cols);
-            return false;
+            goto fail;
         }
         for (size_t i = 0; i < vr->n_values; i++) {
             if (expr_has_column_ref(vr->values[i])) {
                 snprintf(err, err_len, "row %zu: column references are not allowed in VALUES", r + 1);
-                free(cols);
-                return false;
+                goto fail;
             }
             if (!expr_fits_column(vr->values[i], &empty_ctx, t->types[cols[i]], t->names[cols[i]], err, err_len)) {
-                free(cols);
-                return false;
+                goto fail;
             }
         }
 
         size_t row = table_append_row(t);
         if (row == SIZE_MAX || table_failed(t)) {
             snprintf(err, err_len, "out of memory inserting into %s", stmt->table);
-            free(cols);
-            return false;
+            goto fail;
         }
         for (size_t i = 0; i < vr->n_values; i++)
             assign_value(t, row, cols[i], eval_value(vr->values[i], &empty_ctx));
+        if (table_failed(t)) { /* e.g. a TEXT value's heap append ran out of memory */
+            snprintf(err, err_len, "out of memory inserting into %s", stmt->table);
+            table_delete_row(t, row);
+            goto fail;
+        }
 
         if (!check_row_constraints(t, row, catalog, err, err_len)) {
             table_delete_row(t, row);
-            free(cols);
-            return false;
+            goto fail;
         }
-        if (txn) txn_log_insert(txn, t, catalog->tables[t_idx].name, row);
+        if (txn && !txn_log_insert(txn, (size_t)t_idx, catalog->tables[t_idx].name, row)) {
+            snprintf(err, err_len, "out of memory logging insert into %s", stmt->table);
+            table_delete_row(t, row);
+            goto fail;
+        }
         n_inserted++;
     }
 
     free(cols);
     *out_changes = n_inserted;
     return true;
+
+fail:
+    if (txn) txn_rollback_to(txn, catalog, mark);
+    free(cols);
+    return false;
 }
 
 static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
@@ -1358,6 +1448,13 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
         return false;
     }
 
+    /* One UPDATE can match many rows - a later row failing a check must
+     * not leave earlier rows *this same statement* already changed while
+     * the statement reports failure. mark is this transaction's undo log
+     * length before any row is touched; see txn_rollback_to and
+     * interp_exec_insert's identical use of it just above. */
+    size_t mark = txn ? txn->count : 0;
+
     size_t n_updated = 0;
     Cursor cur;
     cursor_init(&cur, t);
@@ -1368,11 +1465,7 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
 
         if (stmt->where && eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
 
-        if (pk_updated && !check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) {
-            free(cols);
-            free(new_vals);
-            return false;
-        }
+        if (pk_updated && !check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) goto fail;
 
         /* Evaluate every assignment's RHS against the row's state before any of
          * this row's assignments are applied - "SET a = b, b = a" swaps rather
@@ -1380,15 +1473,18 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
         for (size_t i = 0; i < stmt->n_assignments; i++)
             new_vals[i] = eval_value(stmt->assignments[i].value, &ctx);
         for (size_t i = 0; i < stmt->n_assignments; i++) {
-            if (txn) txn_log_update(txn, t, catalog->tables[t_idx].name, row, (size_t)cols[i]);
+            if (txn && !txn_log_update(txn, t, (size_t)t_idx, catalog->tables[t_idx].name, row, (size_t)cols[i])) {
+                snprintf(err, err_len, "out of memory logging update to %s", stmt->table);
+                goto fail; /* not yet applied via assign_value below - nothing to undo for this one assignment */
+            }
             assign_value(t, row, cols[i], new_vals[i]);
         }
-
-        if (!check_row_constraints(t, row, catalog, err, err_len)) {
-            free(cols);
-            free(new_vals);
-            return false;
+        if (table_failed(t)) { /* e.g. a TEXT value's heap append ran out of memory */
+            snprintf(err, err_len, "out of memory updating %s", stmt->table);
+            goto fail;
         }
+
+        if (!check_row_constraints(t, row, catalog, err, err_len)) goto fail;
         n_updated++;
     }
 
@@ -1396,6 +1492,12 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     free(new_vals);
     *out_changes = n_updated;
     return true;
+
+fail:
+    if (txn) txn_rollback_to(txn, catalog, mark);
+    free(cols);
+    free(new_vals);
+    return false;
 }
 
 static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
@@ -1411,6 +1513,13 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
     RowCtx    static_ctx = { &src0, 1, params, n_params };
     if (stmt->where && !validate_where(stmt->where, &static_ctx, err, err_len)) return false;
 
+    /* One DELETE can match many rows - a later row failing its FK-reference
+     * check must not leave earlier rows *this same statement* already
+     * deleted while the statement reports failure. mark is this
+     * transaction's undo log length before any row is touched; see
+     * txn_rollback_to and interp_exec_insert's identical use of it above. */
+    size_t mark = txn ? txn->count : 0;
+
     size_t n_deleted = 0;
     Cursor cur;
     cursor_init(&cur, t);
@@ -1420,9 +1529,16 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
         RowCtx    ctx = { &src, 1, params, n_params };
         if (stmt->where && eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
 
-        if (!check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) return false;
+        if (!check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) {
+            if (txn) txn_rollback_to(txn, catalog, mark);
+            return false;
+        }
 
-        if (txn) txn_log_delete(txn, t, catalog->tables[t_idx].name, row);
+        if (txn && !txn_log_delete(txn, (size_t)t_idx, catalog->tables[t_idx].name, row)) {
+            snprintf(err, err_len, "out of memory logging delete from %s", stmt->table);
+            txn_rollback_to(txn, catalog, mark); /* row itself not yet marked dead below - nothing extra to undo for it */
+            return false;
+        }
         table_delete_row(t, row);
         n_deleted++;
     }
@@ -1562,12 +1678,48 @@ static bool commit_wal_for_table(Catalog *catalog, Table *table, const char *tab
     lock.fd = -1;
     bool have_lock = db4_lock_open(&lock, path) && db4_lock_exclusive(&lock);
 
-    bool ok = wal_append(wal_path, table, rows, n_rows);
+    /* Unlike load_csv's shared (read) lock, failing to get this exclusive
+     * lock isn't safe to just warn about and proceed anyway: appending to
+     * the WAL unlocked is exactly the torn-write scenario the lock exists
+     * to rule out for a concurrent reader's `.load` snapshot (see this
+     * function's doc comment) - a write path gets a hard failure, not a
+     * best-effort warning, precisely because "probably fine" isn't good
+     * enough for the thing durability depends on. */
+    if (!have_lock) {
+        db4_lock_close(&lock);
+        snprintf(err, err_len,
+                 "commit failed: could not acquire an exclusive lock on \"%s\" for table \"%s\" "
+                 "(another process may be holding it, or its lock file could not be created)",
+                 path, table_name);
+        return false;
+    }
 
-    if (have_lock) db4_lock_release(&lock);
+    /* dump_csv compacts (and so renumbers) live rows on every checkpoint -
+     * if another process has checkpointed this table since this process
+     * loaded it, table's in-memory row numbers no longer line up with the
+     * base CSV's, and appending a frame under one of them would silently
+     * misattribute it (or manufacture a phantom row) on the next replay.
+     * Checked here, under the same exclusive lock a concurrent checkpoint
+     * also holds while it dumps/removes/bumps the generation, so there's
+     * no window where this check could pass right before a checkpoint
+     * invalidates it. */
+    uint32_t current_gen = 0;
+    bool     have_gen     = wal_read_generation(path, &current_gen);
+    bool     stale        = have_gen && current_gen != table->wal_generation;
+
+    bool ok = stale ? false : wal_append(wal_path, table, rows, n_rows);
+
+    db4_lock_release(&lock);
     db4_lock_close(&lock);
 
-    if (!ok) snprintf(err, err_len, "commit failed: could not append to WAL for \"%s\"", table_name);
+    if (!ok) {
+        if (stale)
+            snprintf(err, err_len,
+                     "table \"%s\" was checkpointed by another process since it was loaded here - "
+                     ".load it again and retry", table_name);
+        else
+            snprintf(err, err_len, "commit failed: could not append to WAL for \"%s\"", table_name);
+    }
     return ok;
 }
 
@@ -1583,12 +1735,12 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
     }
 
     for (size_t i = 0; i < txn->count; i++) {
-        Table      *table      = txn->log[i].table;
+        size_t      table_idx  = txn->log[i].table_idx;
         const char *table_name = txn->log[i].table_name;
 
         bool table_seen_before = false;
         for (size_t j = 0; j < i; j++)
-            if (txn->log[j].table == table) { table_seen_before = true; break; }
+            if (txn->log[j].table_idx == table_idx) { table_seen_before = true; break; }
         if (table_seen_before) continue;
 
         size_t *rows = malloc(txn->count * sizeof(size_t));
@@ -1599,7 +1751,7 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
 
         size_t n_rows = 0;
         for (size_t j = i; j < txn->count; j++) {
-            if (txn->log[j].table != table) continue;
+            if (txn->log[j].table_idx != table_idx) continue;
             size_t row = txn->log[j].row;
             bool   dup = false;
             for (size_t k = 0; k < n_rows; k++)
@@ -1607,7 +1759,8 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
             if (!dup) rows[n_rows++] = row;
         }
 
-        bool ok = commit_wal_for_table(catalog, table, table_name, rows, n_rows, err, err_len);
+        Table *table = &catalog->tables[table_idx].table;
+        bool   ok    = commit_wal_for_table(catalog, table, table_name, rows, n_rows, err, err_len);
         free(rows);
         if (!ok) return false;
     }
@@ -1647,7 +1800,7 @@ bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, const Value *para
                 snprintf(err, err_len, "no transaction is active");
                 return false;
             }
-            txn_rollback(txn);
+            txn_rollback(txn, catalog);
             return true;
         case STMT_INSERT:
         case STMT_UPDATE:
@@ -1669,7 +1822,7 @@ bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, const Value *para
 
             if (autocommit) {
                 if (ok) ok = interp_exec_commit(catalog, txn, err, err_len);
-                else    txn_rollback(txn);
+                else    txn_rollback(txn, catalog);
             }
             return ok;
         }

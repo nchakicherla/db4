@@ -54,4 +54,14 @@ uint64_t value_hash(Value v);
  * text-column convenience callback uses) - "NULL" for a null value. */
 void print_value(FILE *f, Value v);
 
+/* Renders v as the shortest decimal string that reads back (via strtod) to
+ * the exact same double - "3.14" stays "3.14" rather than the noise a fixed
+ * %.17g would print for it, but a value that genuinely needs every digit to
+ * round-trip still gets them, unlike a fixed %g (6 significant digits by
+ * default) which silently drops precision. Shared by print_value (REPL/
+ * db4_exec display) and load.c's dump_cell (CSV/WAL persistence) - one
+ * formatting rule, not two ways for a DOUBLE to lose precision on its way
+ * out. buf must be at least 32 bytes. */
+void format_double(char *buf, size_t buf_len, double v);
+
 #endif

@@ -1,5 +1,7 @@
 #include "value.h"
 
+#include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 Value value_int(int64_t v)    { Value r; r.kind = FT_INT;    r.is_null = false; r.as.i = v; return r; }
@@ -78,6 +80,32 @@ uint64_t value_hash(Value v) {
     }
 }
 
+void format_double(char *buf, size_t buf_len, double v) {
+    /* %g switches to scientific notation whenever exponent >= precision -
+     * fine for genuinely tiny/huge magnitudes, but it also fires for a
+     * "clean" value like 20.0 the moment the search tries precision 1
+     * (exponent 1 >= precision 1), latching onto "2e+01" instead of "20"
+     * even though both round-trip identically. Starting the search past
+     * the value's own decimal exponent keeps %g in fixed notation for any
+     * value where fixed notation is actually reasonable, without capping
+     * how far the search can still climb for a value that genuinely needs
+     * every digit (see the loop below - this only raises the floor). */
+    int min_prec = 1;
+    if (v != 0.0 && isfinite(v)) {
+        int exp10 = (int)floor(log10(fabs(v)));
+        if (exp10 > 0 && exp10 + 2 > min_prec) min_prec = exp10 + 2;
+        if (min_prec > 17) min_prec = 17;
+    }
+
+    for (int prec = min_prec; prec <= 17; prec++) {
+        snprintf(buf, buf_len, "%.*g", prec, v);
+        if (strtod(buf, NULL) == v) return;
+    }
+    /* Unreachable for a finite double - %.17g always round-trips one - but
+     * NaN never compares equal to itself, so it always runs the full loop;
+     * buf is left holding the prec=17 rendering either way, which is fine. */
+}
+
 void print_value(FILE *f, Value v) {
     if (v.is_null) {
         fprintf(f, "NULL");
@@ -85,7 +113,12 @@ void print_value(FILE *f, Value v) {
     }
     switch (v.kind) {
         case FT_INT:    fprintf(f, "%lld", (long long)v.as.i); break;
-        case FT_DOUBLE: fprintf(f, "%g", v.as.d); break;
+        case FT_DOUBLE: {
+            char buf[32];
+            format_double(buf, sizeof buf, v.as.d);
+            fprintf(f, "%s", buf);
+            break;
+        }
         case FT_BOOL:   fprintf(f, "%s", v.as.b ? "true" : "false"); break;
         case FT_TEXT:   fprintf(f, "%.*s", (int)v.as.s.len, v.as.s.data); break;
         default: break;

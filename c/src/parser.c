@@ -1,6 +1,7 @@
 #include "parser.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,7 +120,29 @@ static Expr *make_literal_from_token(Parser *p) {
             Expr *e = new_expr(p, EXPR_LIT_INT);
             if (!e) return NULL;
             char buf[32];
-            e->as.int_value = strtoll(copy_token_text(p, buf, sizeof buf), NULL, 10);
+            /* copy_token_text truncates silently past buf's size - a real
+             * risk here (unlike most other identifier-shaped tokens this
+             * function copies) since a truncated digit string parses as a
+             * different, wrong number rather than failing outright. No
+             * real 64-bit integer literal needs anywhere near 31 digits,
+             * so this only ever rejects something already too long to be
+             * a valid int64_t. */
+            if (p->cur.len >= sizeof buf) {
+                parser_fail(p, p->cur.line, "integer literal is too long");
+                return NULL;
+            }
+            char *text = copy_token_text(p, buf, sizeof buf);
+            errno = 0;
+            long long v = strtoll(text, NULL, 10);
+            /* strtoll clamps to LLONG_MIN/MAX and sets ERANGE on overflow
+             * rather than failing - unchecked, a literal like
+             * 99999999999999999999 would silently become INT64_MAX
+             * instead of being rejected. */
+            if (errno == ERANGE) {
+                parser_fail(p, p->cur.line, "integer literal \"%s\" is out of range for a 64-bit integer", text);
+                return NULL;
+            }
+            e->as.int_value = v;
             advance(p);
             return e;
         }
@@ -127,6 +150,10 @@ static Expr *make_literal_from_token(Parser *p) {
             Expr *e = new_expr(p, EXPR_LIT_DOUBLE);
             if (!e) return NULL;
             char buf[64];
+            if (p->cur.len >= sizeof buf) {
+                parser_fail(p, p->cur.line, "floating-point literal is too long");
+                return NULL;
+            }
             e->as.double_value = strtod(copy_token_text(p, buf, sizeof buf), NULL);
             advance(p);
             return e;
@@ -503,8 +530,9 @@ SelectStmt *parser_parse_select(Parser *p) {
         advance(p);
 
         size_t cap = 4, count = 0;
-        char **cols = arena_alloc(p->arena, cap * sizeof(char *), _Alignof(char *));
-        if (!cols) {
+        char **cols  = arena_alloc(p->arena, cap * sizeof(char *), _Alignof(char *));
+        char **quals = arena_alloc(p->arena, cap * sizeof(char *), _Alignof(char *));
+        if (!cols || !quals) {
             parser_fail(p, p->cur.line, "out of memory");
             return NULL;
         }
@@ -512,29 +540,38 @@ SelectStmt *parser_parse_select(Parser *p) {
             if (!expect(p, TOK_IDENT, "a column name")) return NULL;
             if (count == cap) {
                 size_t new_cap = cap * 2;
-                char **grown = arena_grow(p->arena, cols, cap * sizeof(char *),
-                                           new_cap * sizeof(char *), _Alignof(char *));
-                if (!grown) {
+                char **grown_cols = arena_grow(p->arena, cols, cap * sizeof(char *),
+                                                new_cap * sizeof(char *), _Alignof(char *));
+                char **grown_quals = arena_grow(p->arena, quals, cap * sizeof(char *),
+                                                 new_cap * sizeof(char *), _Alignof(char *));
+                if (!grown_cols || !grown_quals) {
                     parser_fail(p, p->cur.line, "out of memory");
                     return NULL;
                 }
-                cols = grown;
-                cap  = new_cap;
+                cols  = grown_cols;
+                quals = grown_quals;
+                cap   = new_cap;
             }
-            /* GROUP BY is single-table-only for now (see interp.c's grouped/
-             * JOIN rejection), so an optional "table." qualifier is accepted
-             * syntactically and then discarded rather than left unparsed -
-             * a joined query with a qualified GROUP BY column should hit
-             * that clear rejection, not a raw parser error here. */
+            /* An optional "table." qualifier is accepted syntactically here
+             * (GROUP BY is single-table-only, but the parser itself has no
+             * semantic knowledge of which table names are meaningful) and
+             * kept alongside its column rather than discarded - interp.c's
+             * exec_select_grouped is what actually validates it, rejecting
+             * anything but the query's own FROM table rather than silently
+             * grouping by the bare column name regardless of what qualifier
+             * was written. */
             const char *qual, *name;
             parse_qualified_name(p, &qual, &name);
             if (p->failed) return NULL;
-            cols[count++] = (char *)name;
+            cols[count]    = (char *)name;
+            quals[count]   = (char *)qual;
+            count++;
             if (p->cur.type != TOK_COMMA) break;
             advance(p);
         }
-        stmt->group_by   = cols;
-        stmt->n_group_by = count;
+        stmt->group_by       = cols;
+        stmt->group_by_table = quals;
+        stmt->n_group_by     = count;
     }
 
     if (p->cur.type == TOK_ORDER) {
@@ -559,8 +596,19 @@ SelectStmt *parser_parse_select(Parser *p) {
         advance(p);
         if (!expect(p, TOK_INT, "a number")) return NULL;
         char buf[32];
+        if (p->cur.len >= sizeof buf) {
+            parser_fail(p, p->cur.line, "LIMIT value is too long");
+            return NULL;
+        }
+        char *text = copy_token_text(p, buf, sizeof buf);
+        errno = 0;
+        long long v = strtoll(text, NULL, 10);
+        if (errno == ERANGE) {
+            parser_fail(p, p->cur.line, "LIMIT value \"%s\" is out of range for a 64-bit integer", text);
+            return NULL;
+        }
         stmt->has_limit = true;
-        stmt->limit     = strtoll(copy_token_text(p, buf, sizeof buf), NULL, 10);
+        stmt->limit     = v;
         advance(p);
     }
 
@@ -1052,7 +1100,7 @@ void select_stmt_print(FILE *f, const SelectStmt *stmt) {
         fprintf(f, " group by ");
         for (size_t i = 0; i < stmt->n_group_by; i++) {
             if (i) fprintf(f, ", ");
-            fprintf(f, "%s", stmt->group_by[i]);
+            print_qualified(f, stmt->group_by_table[i], stmt->group_by[i]);
         }
     }
     if (stmt->has_order_by) {

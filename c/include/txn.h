@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "catalog.h"
 #include "table.h"
 
 typedef enum {
@@ -12,16 +13,19 @@ typedef enum {
     UNDO_DELETE,
 } UndoKind;
 
-/* table_name is a borrowed pointer into the Catalog's NamedTable.name -
- * stable for the life of the session, since nothing renames or drops
- * tables yet. txn.c itself only knows about Table, not Catalog (the
- * layered architecture puts the transaction manager below the catalog),
- * so table_name travels alongside the Table* purely so a higher layer
- * (interp.c) can find which tables to durably flush at commit without
- * re-deriving it. */
+/* table_idx indexes into the Catalog this Txn is running against, resolved
+ * to a live Table* only at undo/commit time (txn_rollback and interp.c's
+ * commit path both take a Catalog* for exactly this). A raw Table* used to
+ * be stored directly here, but catalog_put's realloc of catalog->tables[]
+ * (e.g. a .load or CREATE TABLE later in the same transaction) can move
+ * that array out from under an already-logged entry - storing the index
+ * instead means growth never invalidates it. table_name is still a
+ * borrowed pointer into the Catalog's NamedTable.name (stable for the life
+ * of the session), kept alongside purely so interp.c's commit path can
+ * find which tables to durably flush without re-deriving it. */
 typedef struct {
     UndoKind    kind;
-    Table      *table;
+    size_t      table_idx;
     const char *table_name;
     size_t      row;
 
@@ -53,12 +57,33 @@ void txn_term(Txn *txn);
 
 bool txn_begin(Txn *txn, char *err, size_t err_len);
 
-bool txn_log_insert(Txn *txn, Table *table, const char *table_name, size_t row);
-bool txn_log_update(Txn *txn, Table *table, const char *table_name, size_t row, size_t col);
-bool txn_log_delete(Txn *txn, Table *table, const char *table_name, size_t row);
+bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, size_t row);
+/* table is the same table table_idx resolves to right now - passed
+ * separately (not re-derived from catalog here) because txn_log_update
+ * needs to read the cell's current value immediately, before it's
+ * overwritten, and the caller already has the pointer in hand. */
+bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, size_t row, size_t col);
+bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, size_t row);
 
 /* Undoes every logged change, most recently logged first, then clears the
- * log and deactivates the txn. */
-void txn_rollback(Txn *txn);
+ * log and deactivates the txn. catalog resolves each entry's table_idx to
+ * its current Table* - see the UndoEntry comment above for why that's
+ * looked up now rather than stored. */
+void txn_rollback(Txn *txn, Catalog *catalog);
+
+/* Undoes only the entries logged since mark (an earlier txn->count, taken
+ * by interp_exec_insert/update/delete before that statement's row loop
+ * starts), most recently logged first, then truncates the log back to
+ * mark - a single statement's own savepoint, not the whole transaction's:
+ * txn->active and every earlier entry are left untouched, so a mid-
+ * statement constraint failure (e.g. row 3 of a multi-row INSERT, or an
+ * UPDATE that gets partway through matching rows before one fails a check)
+ * can undo just its own partial work and report failure, while everything
+ * an earlier statement in the same still-open transaction already did
+ * stays exactly as it was - the same all-or-nothing guarantee autocommit
+ * already got for free by wrapping a whole statement in begin/commit/
+ * rollback, now true for a statement running inside an explicit BEGIN
+ * alongside others too. */
+void txn_rollback_to(Txn *txn, Catalog *catalog, size_t mark);
 
 #endif

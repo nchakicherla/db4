@@ -17,6 +17,7 @@
 #include "lock.h"
 #include "parser.h"
 #include "table.h"
+#include "value.h"
 #include "wal.h"
 
 /* Every line-processing function below returns one of these instead of a
@@ -65,7 +66,7 @@ static bool take_quoted(const char **pp, char *buf, size_t buf_len) {
 }
 
 static bool cmd_dump(Catalog *catalog, const char *args) {
-    char name[MAX_COL_NAME_LEN], path[512];
+    char name[MAX_COL_NAME_LEN], path[4096]; /* matches load_csv's own path buffer, not main.c's other 1024-byte ones */
     const char *p = args;
     if (!take_word(&p, name, sizeof name) || !take_quoted(&p, path, sizeof path)) {
         printf("usage: .dump <table> \"<path>\"\n");
@@ -88,12 +89,25 @@ static bool cmd_dump(Catalog *catalog, const char *args) {
 
 /* Folds a table's WAL back into its base CSV (M7) - a brief exclusive
  * lock (see lock.h) excludes concurrent readers' `.load` snapshots and
- * other writers' commits while the base file is rewritten. */
-static bool cmd_checkpoint(Catalog *catalog, const char *args) {
+ * other writers' commits while the base file is rewritten.
+ *
+ * txn_active refuses this outright while a transaction is open: dump_csv
+ * writes whatever is in the table's *in-memory* state right now, including
+ * anything the open transaction has changed but not committed - a later
+ * ROLLBACK only undoes memory, so without this guard the checkpoint would
+ * permanently persist rows a ROLLBACK is supposed to have undone (and the
+ * WAL those rows would otherwise have been recoverable from gets deleted
+ * in the same step). */
+static bool cmd_checkpoint(Catalog *catalog, bool txn_active, const char *args) {
     char name[MAX_COL_NAME_LEN];
     const char *p = args;
     if (!take_word(&p, name, sizeof name)) {
         printf("usage: .checkpoint <table>\n");
+        return false;
+    }
+
+    if (txn_active) {
+        printf("cannot .checkpoint while a transaction is open (COMMIT or ROLLBACK first)\n");
         return false;
     }
 
@@ -119,9 +133,21 @@ static bool cmd_checkpoint(Catalog *catalog, const char *args) {
     lock.fd = -1;
     bool have_lock = db4_lock_open(&lock, path) && db4_lock_exclusive(&lock);
 
+    /* Like interp.c's commit path, this is a write - checkpointing without
+     * this lock is exactly the torn-file scenario it exists to rule out
+     * for a concurrent reader's `.load` snapshot or another process's
+     * commit, so a failure to acquire it refuses the checkpoint outright
+     * rather than proceeding unlocked with just a warning. */
+    if (!have_lock) {
+        db4_lock_close(&lock);
+        printf("checkpoint failed for %s: could not acquire an exclusive lock on %s "
+               "(another process may be holding it, or its lock file could not be created)\n", name, path);
+        return false;
+    }
+
     bool ok = wal_checkpoint(path, wal_path, &catalog->tables[idx].table);
 
-    if (have_lock) db4_lock_release(&lock);
+    db4_lock_release(&lock);
     db4_lock_close(&lock);
 
     if (ok) printf("checkpointed %s\n", name);
@@ -227,7 +253,7 @@ static bool cmd_ls(const char *args) {
     }
     closedir(dp);
 
-    qsort(names, n, sizeof(char *), name_cmp);
+    if (n) qsort(names, n, sizeof(char *), name_cmp); /* names is NULL for an empty directory */
     for (size_t i = 0; i < n; i++) {
         printf("%s\n", names[i]);
         free(names[i]);
@@ -262,7 +288,12 @@ static void print_column_value(Db4Stmt *stmt, int i) {
     switch (db4_column_type(stmt, i)) {
         case DB4_NULL: printf("NULL"); break;
         case DB4_INTEGER: printf("%lld", (long long)db4_column_int64(stmt, i)); break;
-        case DB4_FLOAT: printf("%g", db4_column_double(stmt, i)); break;
+        case DB4_FLOAT: {
+            char buf[32];
+            format_double(buf, sizeof buf, db4_column_double(stmt, i));
+            printf("%s", buf);
+            break;
+        }
         case DB4_BOOL: printf("%s", db4_column_bool(stmt, i) ? "true" : "false"); break;
         case DB4_TEXT: {
             size_t len;
@@ -356,11 +387,27 @@ static bool cmd_sql(Db4 *db, const char *line) {
  * failing partway should be visible, not silently skipped past, and a
  * .quit/.exit inside the file must propagate all the way back to
  * main() rather than just ending this one file's processing. */
+/* A .read'd file can itself .read another (including, accidentally or not,
+ * itself), and each nested call recurses through cmd_read -> process_line
+ * -> dispatch -> cmd_read with a line[8192] on every frame - unbounded, that
+ * overflows the stack. g_read_depth caps the nesting the same way most
+ * recursive-file-inclusion tools do (a fixed depth limit, not real cycle
+ * detection - simpler, and a legitimate script nesting anywhere near this
+ * deep would be unusual). */
+#define MAX_READ_DEPTH 32
+static int g_read_depth = 0;
+
 static LineResult cmd_read(Db4 *db, const char *args) {
     char path[1024];
     const char *p = args;
     if (!take_quoted(&p, path, sizeof path)) {
         printf("usage: .read \"<path>\"\n");
+        return LINE_FAIL;
+    }
+
+    if (g_read_depth >= MAX_READ_DEPTH) {
+        printf("read: %s: too many nested .read files (max depth %d) - "
+               "check for a script that .reads itself\n", path, MAX_READ_DEPTH);
         return LINE_FAIL;
     }
 
@@ -370,6 +417,7 @@ static LineResult cmd_read(Db4 *db, const char *args) {
         return LINE_FAIL;
     }
 
+    g_read_depth++;
     LineResult result = LINE_OK;
     char       line[8192];
     while (fgets(line, sizeof line, f)) {
@@ -381,13 +429,14 @@ static LineResult cmd_read(Db4 *db, const char *args) {
         if (result != LINE_OK) break;
     }
     fclose(f);
+    g_read_depth--;
     return result;
 }
 
 static LineResult dispatch(Db4 *db, const char *line) {
     Catalog *catalog = &db->catalog;
     if (strncmp(line, ".load ", 6) == 0) {
-        return load_csv(catalog, line + 6) ? LINE_OK : LINE_FAIL;
+        return load_csv(catalog, db->txn.active, line + 6) ? LINE_OK : LINE_FAIL;
     } else if (strcmp(line, ".tables") == 0) {
         print_tables(catalog);
         return LINE_OK;
@@ -396,7 +445,7 @@ static LineResult dispatch(Db4 *db, const char *line) {
     } else if (strncmp(line, ".dump ", 6) == 0) {
         return cmd_dump(catalog, line + 6) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".checkpoint ", 12) == 0) {
-        return cmd_checkpoint(catalog, line + 12) ? LINE_OK : LINE_FAIL;
+        return cmd_checkpoint(catalog, db->txn.active, line + 12) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".parse ", 7) == 0) {
         return cmd_parse(line + 7) ? LINE_OK : LINE_FAIL;
     } else if (strncmp(line, ".cd ", 4) == 0) {

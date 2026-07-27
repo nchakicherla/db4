@@ -109,6 +109,12 @@ typedef struct {
     Expr *where;
 
     char  **group_by;
+    char  **group_by_table; /* per-entry qualifier, NULL if that entry was unqualified - see parser.c's
+                              * parse_qualified_name call in GROUP BY parsing and interp.c's
+                              * exec_select_grouped, which is what actually validates a qualifier
+                              * (GROUP BY is single-table-only, so the only valid qualifier is the
+                              * query's own FROM table) - the parser itself has no semantic knowledge
+                              * of which table names are meaningful. */
     size_t  n_group_by;
 
     bool  has_order_by;

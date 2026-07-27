@@ -109,6 +109,7 @@ void table_init(Table *t, const char **names, const FieldType *types, size_t n_c
     t->heap_cap  = 0;
     t->pk_col    = -1;
     t->pk_index  = (RowIndex){0};
+    t->wal_generation = 0;
 
     for (size_t i = 0; i < n_cols; i++)
         if (field_width(types[i]) == 0) {

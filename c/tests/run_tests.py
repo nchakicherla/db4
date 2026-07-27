@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(ROOT, "..", "bin", "main")
@@ -152,6 +153,44 @@ def test_m1():
     check("M1 RFC4180 quoting: embedded comma/escaped quote/embedded newline", d,
           ['.load q "quoted.csv"', 'SELECT * FROM q', '.quit'],
           ["hello, world", 'she said "hi"', "line1", "line2", "(3 rows)"])
+
+    # set_cell used to silently leave a cell NULL whenever a field didn't
+    # validate against its column's inferred type (from the first data row),
+    # with no diagnostic at all - a load reported clean while quietly
+    # dropping data. load_row now counts these and load_csv warns.
+    d = fresh_tmp("m1_type_coercion_warning")
+    with open(os.path.join(d, "mixed.csv"), "w") as f:
+        f.write("id,qty\n1,10\n2,not_a_number\n3,30\n")
+    check("M1 .load warns when a value doesn't match its column's inferred type", d,
+          ['.load q "mixed.csv"', 'SELECT * FROM q', 'SELECT sum(qty) FROM q', '.quit'],
+          ["warning: 1 value did not match", "NULL", "40"])
+
+    d = fresh_tmp("m1_no_coercion_warning")
+    check("M1 .load prints no coercion warning when every value matches its type", d,
+          [LOAD_CUSTOMERS_PK, '.quit'],
+          [not_("warning:")])
+
+    # dump_cell used to format DOUBLE with a bare %g (6 significant digits),
+    # silently truncating anything beyond that on every .dump/.checkpoint -
+    # format_double now finds the shortest representation that still reads
+    # back to the exact same double, so a value that genuinely needs more
+    # than 6 digits keeps them, and format_double also has to keep avoiding
+    # %g's own "flip to scientific notation" trigger for round-ish values
+    # like 20.0 or 1000.0 that don't need it.
+    d = fresh_tmp("m1_double_precision_roundtrip")
+    with open(os.path.join(d, "prec.csv"), "w") as f:
+        f.write("id,v\n1,3.14159265358979\n2,123456789.5\n3,20\n4,1000\n5,0.1\n")
+    check("M1 DOUBLE precision survives .dump without truncation or spurious scientific notation", d,
+          ['.load p "prec.csv"', 'SELECT v FROM p ORDER BY id', '.dump p "prec2.csv"', '.quit'],
+          ["3.14159265358979", "123456789.5", "20", "1000", "0.1",
+           not_("3.14159\n"), not_("1.23457e+08"), not_("2e+01"), not_("1e+03")])
+    with open(os.path.join(d, "prec2.csv")) as f:
+        dumped = f.read()
+    problems = []
+    for expect in ("3.14159265358979", "123456789.5", "20", "1000", "0.1"):
+        if expect not in dumped:
+            problems.append(f"expected {expect!r} to survive the dump exactly, got: {dumped!r}")
+    _report("M1 dumped CSV preserves full DOUBLE precision on disk", problems, dumped)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +365,66 @@ def test_m5():
 
 
 # ---------------------------------------------------------------------------
+# Statement atomicity: INSERT/UPDATE/DELETE used to apply changes row by row
+# and just stop (returning failure) the moment one row failed a check -
+# autocommit's own implicit begin/commit/rollback happened to paper over
+# this for a lone statement, but a statement running inside an explicit
+# BEGIN alongside others had no such safety net, so its own already-applied
+# rows stayed applied even though the statement reported failure. Each of
+# INSERT/UPDATE/DELETE now takes a savepoint (txn_rollback_to) before its
+# own row loop and unwinds back to it on any mid-statement failure, so a
+# statement is fully applied or not applied at all, regardless of where it
+# sits inside a transaction.
+# ---------------------------------------------------------------------------
+
+def test_statement_atomicity():
+    d = fresh_tmp("atomic_insert_multirow")
+    check("Atomicity: a multi-row INSERT with a later row violating the PK applies none of it", d,
+          ['CREATE TABLE t (id INT PRIMARY KEY, n INT)',
+           'INSERT INTO t VALUES (1, 10)',
+           'BEGIN',
+           'INSERT INTO t VALUES (2, 20), (3, 30), (1, 999)',  # row 3 collides with the pre-existing id=1
+           'SELECT * FROM t ORDER BY id',
+           '.quit'],
+          ["duplicate value", not_("20"), not_("30"), not_("999"), "(1 row)"])
+
+    d = fresh_tmp("atomic_update_multirow")
+    check("Atomicity: an UPDATE that matches multiple rows leaves none of them changed if a later one fails", d,
+          ['CREATE TABLE t (id INT PRIMARY KEY, n INT)',
+           'INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)',
+           'BEGIN',
+           'UPDATE t SET id = 9 WHERE n > 5',  # row for n=20 succeeds, then n=30 collides on id=9
+           'SELECT * FROM t ORDER BY id',
+           '.quit'],
+          ["duplicate value",
+           lambda o: (o.count("| 9") == 0, "no row should have been left with the colliding id=9"),
+           "1 | 10", "2 | 20", "3 | 30", "(3 rows)"])
+
+    d = fresh_tmp("atomic_delete_multirow")
+    check("Atomicity: a DELETE that matches multiple rows leaves none of them deleted if a later one fails", d,
+          ['CREATE TABLE parent (pid INT PRIMARY KEY)',
+           'CREATE TABLE child (ref INT REFERENCES parent(pid))',
+           'INSERT INTO parent VALUES (1), (2), (3)',
+           'INSERT INTO child VALUES (3)',  # only pid=3 is referenced - the last row cursor_next visits
+           'BEGIN',
+           'DELETE FROM parent WHERE pid > 0',
+           'SELECT * FROM parent ORDER BY pid',
+           '.quit'],
+          ["referenced by", "1", "2", "3", "(3 rows)"])
+
+    d = fresh_tmp("atomic_txn_unaffected")
+    check("Atomicity: rolling back one failed statement doesn't touch an earlier statement's already-applied changes", d,
+          ['CREATE TABLE t (id INT PRIMARY KEY, n INT)',
+           'BEGIN',
+           'INSERT INTO t VALUES (1, 10)',       # succeeds, stays applied
+           'INSERT INTO t VALUES (2, 20), (1, 0)', # fails on the second row - only this statement unwinds
+           'SELECT * FROM t',
+           'COMMIT',
+           '.quit'],
+          ["duplicate value", "1 | 10", not_("2 | 20"), "1 row inserted"])
+
+
+# ---------------------------------------------------------------------------
 # M6: arithmetic, qualified cols, multi-row insert, CREATE TABLE, JOIN, GROUP BY
 # ---------------------------------------------------------------------------
 
@@ -345,6 +444,45 @@ def test_m6():
            "SELECT price FROM orders WHERE id = 1",
            '.quit'],
           [lambda o: (("inf" in o.lower() or "nan" in o.lower()), "expected inf/nan for div by 0")])
+
+    # INT +/-/* used to compute a plain "l + r" (etc.) directly, which is
+    # undefined behavior on signed overflow - not just a sanitizer
+    # complaint but a real miscompilation risk at -O3 (this project's own
+    # build flags). Doing the arithmetic in uint64_t and converting back
+    # gives the exact same two's-complement wraparound value on every
+    # mainstream platform, just without the UB - these check the concrete
+    # values a run under -fsanitize=undefined confirmed no longer trip it.
+    # INT64_MIN is reached via "INT64_MAX + 1" rather than typed directly -
+    # a raw "-9223372036854775808" literal hits the parser's own unchecked-
+    # overflow gap (see bugs.md L8) on the way there, which isn't this
+    # test's concern.
+    d = fresh_tmp("m6_int_overflow")
+    check("M6 INT add/sub overflow wraps (two's complement), doesn't crash", d,
+          ['CREATE TABLE t (id INT PRIMARY KEY, v INT)',
+           'INSERT INTO t VALUES (1, 9223372036854775807)',
+           'UPDATE t SET v = v + 1 WHERE id = 1',   # INT64_MAX + 1 -> INT64_MIN
+           'SELECT v FROM t WHERE id = 1',
+           'UPDATE t SET v = v - 1 WHERE id = 1',   # INT64_MIN - 1 -> INT64_MAX
+           'SELECT v FROM t WHERE id = 1',
+           '.quit'],
+          ["-9223372036854775808", "9223372036854775807"])
+
+    check("M6 INT multiplication overflow wraps, doesn't crash", d,
+          ['CREATE TABLE t2 (id INT PRIMARY KEY, v INT)',
+           'INSERT INTO t2 VALUES (1, 9223372036854775807)',
+           'UPDATE t2 SET v = v * 2 WHERE id = 1',
+           'SELECT v FROM t2',
+           '.quit'],
+          ["1 row updated", "-2"])  # INT64_MAX * 2 wraps to -2 in two's complement
+
+    check("M6 unary negation of INT64_MIN wraps, doesn't crash", d,
+          ['CREATE TABLE t3 (id INT PRIMARY KEY, v INT)',
+           'INSERT INTO t3 VALUES (1, 9223372036854775807)',
+           'UPDATE t3 SET v = v + 1 WHERE id = 1',  # reach INT64_MIN via wraparound
+           'UPDATE t3 SET v = -v WHERE id = 1',      # -INT64_MIN wraps back to itself
+           'SELECT v FROM t3',
+           '.quit'],
+          ["-9223372036854775808"])
 
     d = fresh_tmp("m6_multirow_insert")
     check("M6 multi-row INSERT", d,
@@ -383,6 +521,23 @@ def test_m6():
            "SELECT customer_id, COUNT(*) FROM orders JOIN customers ON orders.customer_id = customers.id GROUP BY customer_id",
            '.quit'],
           [lambda o: ("error" in o.lower() or "not" in o.lower() or "cannot" in o.lower() or "support" in o.lower(), "expected GROUP BY+JOIN rejection")])
+
+    # GROUP BY's table qualifier used to be parsed and then silently
+    # discarded - any qualifier at all (even one naming a table this query
+    # never mentions) was accepted, grouping by the bare column name
+    # regardless. It's now validated against the query's own FROM table
+    # (GROUP BY is single-table-only) instead of just thrown away.
+    check("M6 GROUP BY with a qualifier naming an unrelated table is rejected", d,
+          ['.load orders "orders.csv"',
+           "SELECT customer_id, COUNT(*) FROM orders GROUP BY totally_bogus_table.customer_id",
+           '.quit'],
+          [not_("(2 rows)"), lambda o: ("no such table" in o.lower(), "expected an unknown-table error")])
+
+    check("M6 GROUP BY qualified with the query's own FROM table still works", d,
+          ['.load orders "orders.csv"',
+           "SELECT customer_id, COUNT(*) FROM orders GROUP BY orders.customer_id",
+           '.quit'],
+          ["(2 rows)"])
 
     d = fresh_tmp("m6_ddl_survives_rollback")
     check("M6 CREATE TABLE inside ROLLBACK survives (DDL not undo-logged)", d,
@@ -467,6 +622,110 @@ def test_m7():
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint safety: .checkpoint used to (1) persist an open transaction's
+# uncommitted in-memory state and delete the WAL a ROLLBACK would otherwise
+# recover from, and (2) let a *different* process's already-loaded table go
+# on committing under row numbers a checkpoint's compaction had since
+# renumbered out from under it - both are now refused instead of silently
+# corrupting the base CSV (see wal_checkpoint's generation bump and
+# commit_wal_for_table's generation check in interp.c).
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_safety():
+    d = fresh_tmp("checkpoint_blocked_in_txn")
+    check("Checkpoint: refused while a transaction is open, doesn't leak uncommitted rows to disk", d,
+          [LOAD_CUSTOMERS_PK,
+           'BEGIN',
+           'DELETE FROM customers WHERE id = 2',
+           "INSERT INTO customers (id, name, age) VALUES (99, 'Zoe', 99)",
+           '.checkpoint customers',
+           'ROLLBACK',
+           '.quit'],
+          ["cannot .checkpoint while a transaction is open"])
+    with open(os.path.join(d, "customers.csv")) as f:
+        on_disk = f.read()
+    problems = []
+    if "Zoe" in on_disk:
+        problems.append(f"refused checkpoint must not touch the base CSV, but found the uncommitted insert: {on_disk!r}")
+    if "Bob" not in on_disk:
+        problems.append(f"refused checkpoint must not touch the base CSV, but the rolled-back delete leaked through: {on_disk!r}")
+    _report("Checkpoint: refused checkpoint leaves the base CSV completely untouched", problems, on_disk)
+
+    d = fresh_tmp("checkpoint_cross_process_stale")
+    pa = subprocess.Popen([os.path.abspath(BIN)], cwd=d, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        pa.stdin.write('.load a "customers.csv"\n')
+        pa.stdin.flush()
+        time.sleep(0.3)  # let process A's .load complete before B compacts underneath it
+
+        run(d, ['.load b "customers.csv"', 'DELETE FROM b WHERE id = 2',
+                '.checkpoint b', '.quit'])  # compacts customers.csv down to 2 rows, renumbering them
+
+        out_a, _ = pa.communicate('UPDATE a SET age = 999 WHERE id = 1\n.quit\n', timeout=10)
+    finally:
+        if pa.poll() is None:
+            pa.kill()
+
+    problems = []
+    if "checkpointed by another process" not in out_a:
+        problems.append(f"stale cross-process commit should be refused with a clear error, got: {out_a!r}")
+    with open(os.path.join(d, "customers.csv")) as f:
+        on_disk = f.read()
+    if "999" in on_disk:
+        problems.append(f"refused commit must not have reached the base CSV, got: {on_disk!r}")
+    data_lines = [l for l in on_disk.splitlines() if l][1:]  # drop header
+    if len(data_lines) != 2:
+        problems.append(f"expected exactly the 2 rows B's checkpoint left behind, no duplicates/phantom rows, got: {on_disk!r}")
+    _report("Checkpoint: a stale cross-process commit is refused, not silently corrupted", problems, out_a + "\n" + on_disk)
+
+
+# ---------------------------------------------------------------------------
+# WAL replay safety: apply_row_payload used to decode a frame's bytes
+# according to the table's *current* column types with no bounds checking,
+# so a base CSV edited between sessions (column types are inferred fresh
+# from each .load, per field.c) that changes a column's type out from under
+# an unreplayed WAL could read past the payload buffer. wal_append now
+# writes a one-time schema fingerprint header, and wal_replay refuses to
+# replay anything at all if it doesn't match the table being loaded.
+# ---------------------------------------------------------------------------
+
+def test_wal_schema_drift():
+    d = fresh_tmp("wal_schema_drift")
+    with open(os.path.join(d, "drift.csv"), "w") as f:
+        f.write("id,payload\n1,42\n")
+    run(d, ['.load w "drift.csv"', 'BEGIN', 'UPDATE w SET payload = 4242 WHERE id = 1', 'COMMIT', '.quit'])
+    assert os.path.exists(os.path.join(d, "drift.csv.wal")), "commit should create a WAL file"
+
+    # Rewrite the base CSV so payload's first data row is no longer numeric -
+    # the next .load infers payload as TEXT, while the WAL still holds an
+    # INT-shaped frame for it.
+    with open(os.path.join(d, "drift.csv"), "w") as f:
+        f.write("id,payload\n1,abc\n")
+
+    out = run(d, ['.load w "drift.csv"', 'SELECT * FROM w', '.quit'])
+    check_name = "WAL replay: schema drift since the frame was written is refused, not misdecoded"
+    problems = _evaluate_checks(out, [
+        "warning: WAL replay",              # load.c's existing fallback message fires
+        "loaded 1 row",                     # .load still succeeds against the base CSV alone
+        "abc",                              # base CSV's own value stands, not misdecoded WAL bytes
+        not_("4242"),
+    ])
+    _report(check_name, problems, out)
+
+    # A WAL replayed against the *same* schema it was written under (no
+    # drift) must still work normally - the fingerprint isn't just always
+    # refusing.
+    d2 = fresh_tmp("wal_schema_no_drift")
+    with open(os.path.join(d2, "stable.csv"), "w") as f:
+        f.write("id,payload\n1,42\n")
+    run(d2, ['.load w "stable.csv"', 'BEGIN', 'UPDATE w SET payload = 4242 WHERE id = 1', 'COMMIT', '.quit'])
+    check("WAL replay: unchanged schema still replays normally", d2,
+          ['.load w2 "stable.csv"', 'SELECT * FROM w2', '.quit'],
+          ["4242", not_("warning: WAL replay")])
+
+
+# ---------------------------------------------------------------------------
 # M8: public API surface via REPL (db4.h/db4.c mediated)
 # ---------------------------------------------------------------------------
 
@@ -545,6 +804,38 @@ def test_pk_index_lookup():
 
 
 # ---------------------------------------------------------------------------
+# PK index cross-type probes: value_hash hashes a Value's raw representation
+# (INT and DOUBLE hash differently), while compare_values - what the full
+# WHERE re-check and a non-indexed scan both use - treats them as
+# numerically comparable. Without a type match gate in find_pk_equality, a
+# DOUBLE PK probed with an INT literal (or vice versa) would hash to a slot
+# the index can never have populated and wrongly return zero rows, even
+# though the value is really there.
+# ---------------------------------------------------------------------------
+
+def test_pk_index_cross_type():
+    d = fresh_tmp("pk_index_double_probed_int")
+    check("PK index: a DOUBLE primary key probed with an INT literal still finds the row", d,
+          ['CREATE TABLE s (score DOUBLE PRIMARY KEY, name TEXT)',
+           "INSERT INTO s VALUES (1.5, 'a'), (5.0, 'b'), (7.25, 'c')",
+           'SELECT name FROM s WHERE score = 5',   # INT literal against a DOUBLE PK
+           'SELECT name FROM s WHERE score = 5.0', # DOUBLE literal, same value, for comparison
+           '.quit'],
+          [lambda o: (o.count("b") >= 2, f"expected 'b' from both queries, found {o.count('b')} in: {o!r}"),
+           not_("(0 rows)")])
+
+    d = fresh_tmp("pk_index_int_probed_double")
+    check("PK index: an INT primary key probed with a DOUBLE literal still finds the row", d,
+          ['CREATE TABLE i (id INT PRIMARY KEY, name TEXT)',
+           "INSERT INTO i VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+           'SELECT name FROM i WHERE id = 2.0', # DOUBLE literal against an INT PK
+           'SELECT name FROM i WHERE id = 2',
+           '.quit'],
+          [lambda o: (o.count("b") >= 2, f"expected 'b' from both queries, found {o.count('b')} in: {o!r}"),
+           not_("(0 rows)")])
+
+
+# ---------------------------------------------------------------------------
 # Index-accelerated joins: exec_select_plain's join loop probes the inner
 # table's pk_index once per outer row (via find_join_pk_equality) instead
 # of a full nested-loop scan, when the ON clause has a top-level
@@ -597,6 +888,87 @@ def test_join_index_lookup():
            not_("Bob"),  # order 2 still points at customer_id=2, which no longer exists - inner join drops it
            lambda o: (o.count("Alice") == 2, "Alice's two orders should be unaffected"),
            "(2 rows)"])  # only orders 1 and 3 (Alice) now match - order 2's join partner is gone
+
+    # Same representation-vs-numeric-comparison gap as test_pk_index_cross_type,
+    # but for the join fast path: an INT primary key joined against a DOUBLE
+    # foreign column used to hash-miss every real match.
+    d = fresh_tmp("join_index_cross_type")
+    check("Join index: an INT primary key joined against a DOUBLE column still matches", d,
+          ['CREATE TABLE i (id INT PRIMARY KEY, name TEXT)',
+           "INSERT INTO i VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+           'CREATE TABLE j (ref DOUBLE, tag TEXT)',
+           "INSERT INTO j VALUES (2.0, 'X'), (3.0, 'Y')",
+           "SELECT j.tag, i.name FROM j INNER JOIN i ON i.id = j.ref ORDER BY j.tag",
+           '.quit'],
+          ["X", "b", "Y", "c", "(2 rows)"])
+
+
+# ---------------------------------------------------------------------------
+# Transaction/catalog safety: UndoEntry used to store a raw Table* into
+# catalog->tables[], which catalog_put can move (realloc, on the array
+# growing) or replace outright (loading an existing name again). Both are
+# now handled - growth is safe because UndoEntry stores a table index
+# instead of a pointer, and reloading an existing name while a transaction
+# is open is refused outright, since that specific replaces a table's
+# Table struct wholesale. These are functional (not crash) assertions -
+# the underlying bug was a use-after-free/OOB write, so the strongest way
+# to catch a regression here is rerunning this same suite under
+# -fsanitize=address,undefined, not just checking stdout looks right.
+# ---------------------------------------------------------------------------
+
+def test_txn_catalog_safety():
+    d = fresh_tmp("txn_catalog_growth_rollback")
+    check("Txn safety: catalog growth mid-transaction (ROLLBACK) doesn't corrupt other tables", d,
+          ['CREATE TABLE t1 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t2 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t3 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t4 (id INT PRIMARY KEY, n INT)',
+           'BEGIN',
+           'INSERT INTO t1 VALUES (1, 10)',
+           'CREATE TABLE t5 (id INT PRIMARY KEY, n INT)',  # 5th catalog_put - triggers realloc
+           'INSERT INTO t1 VALUES (2, 20)',
+           'ROLLBACK',
+           'SELECT * FROM t1',
+           '.quit'],
+          ["(0 rows)", not_("10"), not_("20")])
+
+    d = fresh_tmp("txn_catalog_growth_commit")
+    check("Txn safety: catalog growth mid-transaction (COMMIT) keeps both inserted rows intact", d,
+          ['CREATE TABLE t1 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t2 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t3 (id INT PRIMARY KEY, n INT)',
+           'CREATE TABLE t4 (id INT PRIMARY KEY, n INT)',
+           'BEGIN',
+           'INSERT INTO t1 VALUES (1, 10)',
+           'CREATE TABLE t5 (id INT PRIMARY KEY, n INT)',
+           'INSERT INTO t1 VALUES (2, 20)',
+           'COMMIT',
+           'SELECT * FROM t1 ORDER BY id',
+           '.quit'],
+          ["10", "20", "(2 rows)"])
+
+    d = fresh_tmp("txn_reload_blocked")
+    check("Txn safety: .load over an existing table is refused while a transaction is open", d,
+          [LOAD_CUSTOMERS_PK,
+           'BEGIN',
+           'DELETE FROM customers WHERE id = 2',
+           LOAD_CUSTOMERS_PK,  # same name "customers" - must be refused, not applied
+           'ROLLBACK',
+           'SELECT name FROM customers ORDER BY id',
+           '.quit'],
+          ["cannot .load over table",
+           "Alice", "Bob", "Carol", "(3 rows)"])  # rollback still sees the original 3 rows
+
+    d = fresh_tmp("txn_reload_new_name_ok")
+    check("Txn safety: .load of a brand-new table name mid-transaction is unaffected", d,
+          [LOAD_CUSTOMERS_PK,
+           'BEGIN',
+           'DELETE FROM customers WHERE id = 2',
+           '.load orders "orders.csv"',  # different name - must still succeed
+           'COMMIT',
+           'SELECT * FROM orders',
+           '.quit'],
+          [not_("cannot .load"), "loaded", "(3 rows)"])
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +1032,15 @@ def test_batch_mode():
           ['.read "quits.sql"', "SELECT 999999", ".quit"],
           ["table \"t2\" created", not_("1 row inserted"), not_("999999")])
 
+    # A script that .reads itself (directly or through a longer cycle) used
+    # to recurse until the stack overflowed - cmd_read's depth cap turns
+    # that into a clean, bounded error instead.
+    d = fresh_tmp("read_self_reference")
+    check_batch("Batch: a script that .reads itself is refused, not a stack overflow", d,
+                "loop.sql", '.read "loop.sql"\n',
+                ["too many nested .read"],
+                expect_returncode=1)
+
 
 def main():
     if not os.path.exists(BIN):
@@ -667,8 +1048,10 @@ def main():
         sys.exit(2)
     os.makedirs(TMP, exist_ok=True)
 
-    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8,
-               test_pk_index_lookup, test_join_index_lookup, test_batch_mode]:
+    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_statement_atomicity, test_m6, test_m7,
+               test_checkpoint_safety, test_wal_schema_drift, test_m8,
+               test_pk_index_lookup, test_pk_index_cross_type, test_join_index_lookup,
+               test_txn_catalog_safety, test_batch_mode]:
         try:
             fn()
         except AssertionError as e:

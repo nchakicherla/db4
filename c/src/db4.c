@@ -311,10 +311,24 @@ bool db4_exec(Db4 *db, const char *sql, Db4ExecCallback cb, void *ctx) {
         }
 
         const Value *row = &stmt->rs.cells[(stmt->row_idx - 1) * stmt->rs.n_cols];
+        bool row_oom = false;
         for (int i = 0; i < n_cols; i++) {
-            owned[i]     = format_value_text(row[i]);
+            owned[i] = format_value_text(row[i]);
+            /* format_value_text returns NULL for both a genuinely NULL
+             * cell and a failed allocation - row[i].is_null is what
+             * actually disambiguates them, so a failure here (row[i] not
+             * null, yet nothing came back) is real out-of-memory, not a
+             * NULL column the callback should be told about as one. */
+            if (!owned[i] && !row[i].is_null) { row_oom = true; break; }
             col_text[i]  = owned[i];
             col_names[i] = stmt->rs.col_names[i];
+        }
+        if (row_oom) {
+            for (int i = 0; i < n_cols; i++) free(owned[i]);
+            free(owned); free(col_text); free(col_names);
+            snprintf(db->errmsg, sizeof db->errmsg, "out of memory");
+            ok = false;
+            break;
         }
 
         bool cont = cb(ctx, n_cols, col_text, col_names);

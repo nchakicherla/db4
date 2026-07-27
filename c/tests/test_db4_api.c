@@ -209,6 +209,54 @@ int main(void) {
         db4_finalize(stmt);
     }
 
+    /* db4_reset: the point of prepare/bind/step/reset is reusing one
+     * compiled statement across several executions with different bound
+     * values, instead of re-preparing (re-parsing) the SQL each time. */
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        CHECK(db4_bind_int64(stmt, 1, 1), "bind id=1 should succeed");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_ROW, "id=1 should match a row");
+        size_t len;
+        const char *txt = db4_column_text(stmt, 0, &len);
+        CHECK(len == 1 && txt[0] == 'a', "id=1 should be 'a'");
+        rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "only one row should match id=1");
+
+        db4_reset(stmt);
+        CHECK(db4_bind_int64(stmt, 1, 2), "rebinding after reset should succeed");
+        rc = db4_step(stmt);
+        CHECK(rc == DB4_ROW, "after reset+rebind, id=2 should match a row");
+        txt = db4_column_text(stmt, 0, &len);
+        CHECK(len == 1 && txt[0] == 'b', "id=2 should be 'b'");
+        rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "only one row should match id=2");
+
+        /* Resetting again and rebinding the same statement a third time,
+         * to a value that matches no row, confirms reset isn't a one-shot
+         * affordance and DB4_DONE on the first step still works cleanly. */
+        db4_reset(stmt);
+        CHECK(db4_bind_int64(stmt, 1, 999), "rebinding after a second reset should succeed");
+        rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "id=999 should match no row");
+
+        db4_finalize(stmt);
+    }
+
+    /* db4_reset on a statement that never executed, and reset(NULL), must
+     * both be safe no-ops. */
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        db4_reset(stmt);
+        CHECK(db4_bind_int64(stmt, 1, 3), "bind after a no-op reset should still succeed");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_ROW, "statement should still execute normally after a pre-execution reset");
+        db4_finalize(stmt);
+    }
+    db4_reset(NULL);
+
     /* db4_finalize(NULL) must be a safe no-op */
     db4_finalize(NULL);
 

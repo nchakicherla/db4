@@ -599,6 +599,16 @@ cost, so there's nothing concrete yet pushing on it.
     syntax yet - a bare `?` in a REPL line just stays unbound - so this is
     reachable today only through `db4.h` directly, same as the rest of the
     public API's story so far.
+  - **`db4_reset`**: puts a `Db4Stmt` back into its pre-execution state
+    (`executed`/`failed`/`row_idx` cleared, its `ResultSet` freed) so the
+    same compiled statement can run again without re-preparing (re-parsing)
+    the SQL - the actual payoff of splitting prepare from step, and the
+    natural pairing with parameter binding above (bind, step, reset,
+    rebind only what changed, step again - sqlite3_reset's shape). Bound
+    parameters are deliberately left alone by reset, matching
+    `sqlite3_reset` rather than sqlite3's separate `sqlite3_clear_bindings`
+    - there's no equivalent of the latter here yet, nothing has asked for
+    it.
 - **Page storage (not started)**: replacing CSV+WAL with a fixed-size-page
   file format (page size, free list, a table b-tree keyed by rowid), with
   indexes (b-tree on a declared column) becoming viable once storage is

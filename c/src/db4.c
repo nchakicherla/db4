@@ -144,6 +144,23 @@ void db4_finalize(Db4Stmt *stmt) {
     free(stmt);
 }
 
+/* Puts stmt back into its pre-execution state so the next db4_step re-runs
+ * it from scratch - sqlite3_reset's shape, minus a returned error code:
+ * nothing here can itself fail (freeing an already-empty ResultSet is
+ * safe), so there's nothing meaningful to report. Bound parameters are
+ * deliberately left alone (matching sqlite3_reset, not sqlite3's separate
+ * sqlite3_clear_bindings) - the point is reuse: bind, step, reset, rebind
+ * just the values that changed, step again, without re-parsing the SQL
+ * each time. Safe to call whether or not the statement has run yet. */
+void db4_reset(Db4Stmt *stmt) {
+    if (!stmt) return;
+    result_set_free(&stmt->rs);
+    stmt->rs       = (ResultSet){0};
+    stmt->row_idx  = 0;
+    stmt->executed = false;
+    stmt->failed   = false;
+}
+
 int db4_bind_parameter_count(const Db4Stmt *stmt) {
     return (int)stmt->n_params;
 }

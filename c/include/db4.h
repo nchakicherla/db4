@@ -87,6 +87,14 @@ int db4_step(Db4Stmt *stmt);
 
 void db4_finalize(Db4Stmt *stmt);
 
+/* Resets stmt to its pre-execution state (sqlite3_reset's shape) so the
+ * next db4_step runs it again from scratch, without re-parsing the SQL -
+ * the actual payoff of separating prepare from step. Bound parameters are
+ * left as they are (matching sqlite3_reset, not sqlite3's separate
+ * sqlite3_clear_bindings): the intended loop is db4_bind_*, db4_step,
+ * db4_reset, db4_bind_* (only the values that changed), db4_step, ... */
+void db4_reset(Db4Stmt *stmt);
+
 /* Column count/name are available as soon as this returns - unlike
  * db4_column_type/_int64/_double/_bool/_text below, which need a row
  * fetched by db4_step first. A SELECT's ResultSet (names included) isn't

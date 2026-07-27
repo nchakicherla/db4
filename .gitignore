@@ -2,4 +2,5 @@ c/obj/
 c/bin/
 c/tests/tmp/
 c/tests/__pycache__/
+*.lock
 .DS_Store

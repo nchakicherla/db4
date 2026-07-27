@@ -1,9 +1,12 @@
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "arena.h"
 #include "db4.h"
@@ -34,29 +37,30 @@ static bool take_word(const char **pp, char *buf, size_t buf_len) {
     return true;
 }
 
-static void cmd_dump(Catalog *catalog, const char *args) {
-    char name[MAX_COL_NAME_LEN], path[512];
-    const char *p = args;
-    if (!take_word(&p, name, sizeof name)) {
-        printf("usage: .dump <table> \"<path>\"\n");
-        return;
-    }
-    p = skip_spaces(p);
-    if (*p != '"') {
-        printf("usage: .dump <table> \"<path>\"\n");
-        return;
-    }
+/* Parses a "..."-quoted argument (no escape sequences). Leaves *pp just
+ * past the closing quote on success. */
+static bool take_quoted(const char **pp, char *buf, size_t buf_len) {
+    const char *p = skip_spaces(*pp);
+    if (*p != '"') return false;
     p++;
     size_t n = 0;
     while (*p && *p != '"') {
-        if (n + 1 >= sizeof path) { printf("path too long\n"); return; }
-        path[n++] = *p++;
+        if (n + 1 >= buf_len) return false;
+        buf[n++] = *p++;
     }
-    if (*p != '"') {
+    if (*p != '"') return false;
+    buf[n] = '\0';
+    *pp = p + 1;
+    return true;
+}
+
+static void cmd_dump(Catalog *catalog, const char *args) {
+    char name[MAX_COL_NAME_LEN], path[512];
+    const char *p = args;
+    if (!take_word(&p, name, sizeof name) || !take_quoted(&p, path, sizeof path)) {
         printf("usage: .dump <table> \"<path>\"\n");
         return;
     }
-    path[n] = '\0';
 
     int idx = catalog_find(catalog, name);
     if (idx < 0) {
@@ -125,6 +129,92 @@ static void cmd_schema(Catalog *catalog, const char *args) {
     }
 
     print_schema(&catalog->tables[idx].table);
+}
+
+/* Basic filesystem navigation, so a REPL session can move around to
+ * wherever the CSVs it wants to `.load`/`.dump` actually live without
+ * exiting back to a shell. Paths are quoted, same convention as `.dump`'s
+ * path argument (not `.schema`'s bare table-name word) - both because a
+ * path can contain a space and because it lets tab completion's existing
+ * quoted-path handling (complete_filename, below) cover these commands
+ * for free instead of needing a second completion scheme. */
+static void cmd_cd(const char *args) {
+    char path[1024];
+    const char *p = args;
+    if (!take_quoted(&p, path, sizeof path)) {
+        printf("usage: .cd \"<path>\"\n");
+        return;
+    }
+
+    if (chdir(path) != 0) {
+        printf("cd: %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    char cwd[1024];
+    if (getcwd(cwd, sizeof cwd)) printf("%s\n", cwd);
+}
+
+/* Lists a directory's entries, alphabetically (scandir's own job, not
+ * hand-rolled), one per line with a trailing '/' on subdirectories -
+ * matching complete_filename's own convention for the same reason: a
+ * consistent "how does this REPL denote a directory" answer. */
+static int name_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* opendir/readdir + a manual sort, not scandir/alphasort - those are BSD
+ * extensions that glibc hides under -std=c11's strict mode without a
+ * feature-test macro (the reason linenoise.c already needs its own
+ * -D_GNU_SOURCE build rule in the makefile; not worth another one just
+ * for this). opendir/readdir are the same portable POSIX.1 pair
+ * complete_filename below already relies on. */
+static void cmd_ls(const char *args) {
+    char path[1024] = ".";
+    const char *p   = args;
+    if (*skip_spaces(p) != '\0' && !take_quoted(&p, path, sizeof path)) {
+        printf("usage: .ls [\"<path>\"]\n");
+        return;
+    }
+
+    DIR *dp = opendir(path);
+    if (!dp) {
+        printf("ls: %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    char  **names = NULL;
+    size_t  n = 0, cap = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        if (n == cap) {
+            size_t  new_cap = cap ? cap * 2 : 16;
+            char  **grown   = realloc(names, new_cap * sizeof(char *));
+            if (!grown) { printf("out of memory\n"); break; }
+            names = grown;
+            cap   = new_cap;
+        }
+
+        char full[1536];
+        snprintf(full, sizeof full, "%s/%s", path, ent->d_name);
+        struct stat st;
+        bool is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+
+        size_t entry_cap = strlen(ent->d_name) + 2;
+        char  *entry     = malloc(entry_cap);
+        if (!entry) { printf("out of memory\n"); break; }
+        snprintf(entry, entry_cap, is_dir ? "%s/" : "%s", ent->d_name);
+        names[n++] = entry;
+    }
+    closedir(dp);
+
+    qsort(names, n, sizeof(char *), name_cmp);
+    for (size_t i = 0; i < n; i++) {
+        printf("%s\n", names[i]);
+        free(names[i]);
+    }
+    free(names);
 }
 
 /* Lexes and parses any statement and prints the resulting AST without
@@ -248,6 +338,12 @@ static void dispatch(Catalog *catalog, const char *line) {
         cmd_checkpoint(catalog, line + 12);
     } else if (strncmp(line, ".parse ", 7) == 0) {
         cmd_parse(line + 7);
+    } else if (strncmp(line, ".cd ", 4) == 0) {
+        cmd_cd(line + 4);
+    } else if (strcmp(line, ".ls") == 0) {
+        cmd_ls("");
+    } else if (strncmp(line, ".ls ", 4) == 0) {
+        cmd_ls(line + 4);
     } else {
         printf("unknown command: %s\n", line);
     }
@@ -281,7 +377,7 @@ static void add_completion_word(linenoiseCompletions *lc, const char *buf, size_
 }
 
 static const char *DOT_COMMANDS[] = {
-    ".load", ".tables", ".schema", ".dump", ".checkpoint", ".parse", ".quit", ".exit",
+    ".load", ".tables", ".schema", ".dump", ".checkpoint", ".parse", ".cd", ".ls", ".quit", ".exit",
 };
 
 /* Only while the command word itself is still being typed (no space yet)
@@ -329,15 +425,20 @@ static void complete_sql_word(linenoiseCompletions *lc, const char *buf, size_t 
     }
 }
 
-/* Filename completion inside ".load"/".dump"'s quoted path argument - the
- * only quoting convention those two commands use (see cmd_dump/load_csv).
- * "Inside a quote" is approximated as "an odd number of '"' characters
- * seen so far" rather than a real tokenizer; good enough for the one
- * quoted argument these commands actually take, and a misfire (e.g. mid-
- * way through .load's optional quoted JSON schema argument) just yields
- * no matches rather than anything harmful. */
+/* Filename completion inside a quoted path argument - ".load"/".dump"'s
+ * (see cmd_dump/load_csv) and ".cd"/".ls"'s (see take_quoted's doc
+ * comment for why those two are quoted too). "Inside a quote" is
+ * approximated as "an odd number of '"' characters seen so far" rather
+ * than a real tokenizer; good enough for the one quoted argument these
+ * commands actually take, and a misfire (e.g. mid-way through .load's
+ * optional quoted JSON schema argument) just yields no matches rather
+ * than anything harmful. */
 static void complete_filename(linenoiseCompletions *lc, const char *buf) {
-    if (strncmp(buf, ".load ", 6) != 0 && strncmp(buf, ".dump ", 6) != 0) return;
+    static const char *PATH_COMMANDS[] = { ".load ", ".dump ", ".cd ", ".ls " };
+    bool in_path_command = false;
+    for (size_t i = 0; i < sizeof(PATH_COMMANDS) / sizeof(PATH_COMMANDS[0]); i++)
+        if (strncmp(buf, PATH_COMMANDS[i], strlen(PATH_COMMANDS[i])) == 0) { in_path_command = true; break; }
+    if (!in_path_command) return;
 
     size_t quotes = 0, last_quote = 0;
     for (size_t i = 0; buf[i]; i++)

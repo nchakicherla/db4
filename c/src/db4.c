@@ -77,21 +77,30 @@ const Stmt *db4_stmt_ast(const Db4Stmt *stmt) {
     return stmt->stmt;
 }
 
-int db4_step(Db4Stmt *stmt) {
-    if (!stmt->executed) {
-        stmt->executed = true;
+/* Runs the statement on first use (db4_step and, below, the column-metadata
+ * accessors all funnel through here) - a SELECT's ResultSet, column names
+ * included, only exists once interp_exec has actually run it, so a caller
+ * that asks for column_count/column_name before ever stepping (legal, and
+ * expected to work, in sqlite3's prepare/step split - column metadata is
+ * known at compile time there) needs execution triggered on its behalf
+ * rather than being handed a stale zero-column answer. */
+static void ensure_executed(Db4Stmt *stmt) {
+    if (stmt->executed) return;
+    stmt->executed = true;
 
-        char   err[256];
-        size_t changes = 0;
-        bool   ok = interp_exec(stmt->stmt, &stmt->db->catalog, &stmt->db->txn, &stmt->rs, &changes, err, sizeof err);
-        stmt->db->changes = changes;
+    char   err[256];
+    size_t changes = 0;
+    bool   ok = interp_exec(stmt->stmt, &stmt->db->catalog, &stmt->db->txn, &stmt->rs, &changes, err, sizeof err);
+    stmt->db->changes = changes;
 
-        if (!ok) {
-            snprintf(stmt->db->errmsg, sizeof stmt->db->errmsg, "%s", err);
-            stmt->failed = true;
-            return DB4_ERROR;
-        }
+    if (!ok) {
+        snprintf(stmt->db->errmsg, sizeof stmt->db->errmsg, "%s", err);
+        stmt->failed = true;
     }
+}
+
+int db4_step(Db4Stmt *stmt) {
+    ensure_executed(stmt);
 
     if (stmt->failed) return DB4_ERROR;
     if (!stmt->is_select) return DB4_DONE;
@@ -110,12 +119,14 @@ void db4_finalize(Db4Stmt *stmt) {
     free(stmt);
 }
 
-int db4_column_count(const Db4Stmt *stmt) {
-    return stmt->is_select ? (int)stmt->rs.n_cols : 0;
+int db4_column_count(Db4Stmt *stmt) {
+    ensure_executed(stmt);
+    return (stmt->is_select && !stmt->failed) ? (int)stmt->rs.n_cols : 0;
 }
 
-const char *db4_column_name(const Db4Stmt *stmt, int col) {
-    if (!stmt->is_select || col < 0 || (size_t)col >= stmt->rs.n_cols) return NULL;
+const char *db4_column_name(Db4Stmt *stmt, int col) {
+    ensure_executed(stmt);
+    if (!stmt->is_select || stmt->failed || col < 0 || (size_t)col >= stmt->rs.n_cols) return NULL;
     return stmt->rs.col_names[col];
 }
 

@@ -62,8 +62,16 @@ int db4_step(Db4Stmt *stmt);
 
 void db4_finalize(Db4Stmt *stmt);
 
-int         db4_column_count(const Db4Stmt *stmt);
-const char *db4_column_name(const Db4Stmt *stmt, int col);
+/* Column count/name are available as soon as this returns - unlike
+ * db4_column_type/_int64/_double/_bool/_text below, which need a row
+ * fetched by db4_step first. A SELECT's ResultSet (names included) isn't
+ * actually built until the statement runs, so calling either of these
+ * before any db4_step call runs the statement on the caller's behalf as a
+ * side effect - matching sqlite3's contract (column metadata is known at
+ * prepare time there) without requiring a caller to step first just to
+ * learn the shape of what's coming. Non-const: this is why. */
+int         db4_column_count(Db4Stmt *stmt);
+const char *db4_column_name(Db4Stmt *stmt, int col);
 
 /* DB4_NULL if the column's current-row value is NULL, else whichever of
  * DB4_INTEGER/DB4_FLOAT/DB4_BOOL/DB4_TEXT it actually holds. */

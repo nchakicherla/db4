@@ -215,10 +215,21 @@ deliberately not ported; M6 will need to write or re-port that when
 heap bytes) are still unreferenced outside `table.c` — there's still no
 `DELETE`/`UPDATE` yet to produce anything for them to reclaim.
 
-No test suite was ported. db3 has `tests/test_table.c`, `test_index.c`,
-`test_commands_load.c` etc. (part of its ~8,400-assertion suite) covering
-exactly this code; db4 has no test infrastructure yet at all, consistent
-with where this project already stood ("no tests yet").
+db3's `tests/test_table.c`, `test_index.c`, `test_commands_load.c` etc.
+(part of its ~8,400-assertion suite) were never ported. db4 instead grew its
+own black-box regression suite after M8 (`c/tests/`): `run_tests.py` drives
+`bin/main`'s REPL end to end across a battery of M1-M8 scenarios (load/dump/
+schema, FK/PK enforcement, RFC4180 CSV quoting, parser precedence and error
+recovery, `SELECT` projection/`WHERE`/three-valued `NULL`/`ORDER BY`/`LIMIT`,
+autocommit and explicit transactions with rollback, arithmetic/joins/
+aggregates, WAL replay/checkpoint/torn-frame tolerance, and two real
+concurrent-writer processes racing commits against the same CSV+WAL), and
+`test_db4_api.c` calls `db4.h` directly (prepare/step/column/finalize) the
+way a real embedder would, rather than only through `main.c`'s text
+formatting. Both pass clean under ASan+UBSan. Unit-level coverage of
+`table.c`/`index.c`/`arena.c` in isolation (db3-style) is still not
+ported — the current suite is end-to-end through the REPL and the public
+API, not per-module.
 
 ## Guiding principles (carry these forward from db3)
 

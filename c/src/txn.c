@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 void txn_init(Txn *txn) {
     txn->active = false;
@@ -110,20 +109,4 @@ void txn_rollback(Txn *txn) {
         undo_one(&txn->log[i - 1]);
     txn->count  = 0;
     txn->active = false;
-}
-
-size_t txn_commit(Txn *txn, const char **out_names, size_t max) {
-    size_t n = 0;
-    for (size_t i = 0; i < txn->count; i++) {
-        const char *name = txn->log[i].table_name;
-
-        bool seen = false;
-        for (size_t j = 0; j < n; j++)
-            if (strcmp(out_names[j], name) == 0) { seen = true; break; }
-
-        if (!seen && n < max) out_names[n++] = name;
-    }
-    txn->count  = 0;
-    txn->active = false;
-    return n;
 }

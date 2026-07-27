@@ -10,7 +10,9 @@
 #include "budget.h"
 #include "csv.h"
 #include "field.h"
+#include "lock.h"
 #include "schema.h"
+#include "wal.h"
 
 #define LOAD_ARENA_RESERVE ((size_t)8 * ARENA_BLOCK_SIZE)
 
@@ -195,7 +197,16 @@ void load_csv(Catalog *catalog, const char *args) {
     size_t    n_read       = 0;
     size_t    data_charged = 0;
 
+    /* A brief shared (reader) lock around the read + WAL replay below -
+     * see lock.h. Concurrent readers can hold this together; it excludes
+     * only a writer mid-checkpoint (M7). */
+    Db4Lock lock;
+    lock.fd = -1;
+    bool have_lock = db4_lock_open(&lock, path) && db4_lock_shared(&lock);
+
     if (!read_file(path, LOAD_ARENA_RESERVE, &data, &n_read)) {
+        if (have_lock) db4_lock_release(&lock);
+        db4_lock_close(&lock);
         free(schema_file_data);
         return;
     }
@@ -383,6 +394,13 @@ void load_csv(Catalog *catalog, const char *args) {
         n_loaded++;
     }
 
+    {
+        char wal_path[4160];
+        int  wn = snprintf(wal_path, sizeof wal_path, "%s.wal", path);
+        if (wn > 0 && (size_t)wn < sizeof wal_path && !wal_replay(wal_path, &new_table))
+            printf("warning: WAL replay for %s failed; continuing with base data only\n", wal_path);
+    }
+
     Table *slot = catalog_put(catalog, name, path);
     if (!slot) goto oom;
     *slot = new_table;
@@ -395,6 +413,8 @@ void load_csv(Catalog *catalog, const char *args) {
     arena_term(&csv_arena);
     budget_uncharge(data_charged);
     free(data);
+    if (have_lock) db4_lock_release(&lock);
+    db4_lock_close(&lock);
     return;
 
 oom:
@@ -412,6 +432,8 @@ fail:
     if (csv_arena_live) arena_term(&csv_arena);
     budget_uncharge(data_charged);
     free(data);
+    if (have_lock) db4_lock_release(&lock);
+    db4_lock_close(&lock);
 }
 
 static bool csv_field_needs_quotes(const char *s, size_t len) {

@@ -182,9 +182,13 @@ prototype:
   rollback (DDL isn't undo-logged) while a same-transaction `INSERT` in a
   pre-existing table was correctly undone.
 
-Nothing here does concurrency yet (M7), and there's still no WAL (M5's
-follow-on step) so every commit rewrites each touched table's whole CSV
-file - that's the remaining subject of this plan.
+M7 added the WAL (`wal.c`/`wal.h`) and a `flock()`-backed reader/writer
+lock (`lock.c`/`lock.h`): commit now WAL-appends just the rows a
+transaction touched instead of rewriting each table's whole CSV file, and
+`.checkpoint <table>` folds the WAL back into the base CSV on demand. See
+M7 below for the full write-up and its scope boundary (no live
+"see-new-commits-without-reloading" story yet - that needs M8's
+connection object first).
 
 ### Stale scaffolding notes
 
@@ -379,21 +383,17 @@ crash mid-write can't corrupt the table. Concretely:
    grammar this needed. `dump_csv` (in `load.c`, used by both `.dump` and
    commit) now does the temp-write/`fsync`/`rename` itself, so `.dump`
    gets the same atomicity for free.
-2. **Follow-on (not done): an append-only WAL** of row-level changes
-   (`txn_id`, op, row bytes, checksum) so commit is an `fsync` of a small
-   append rather than a rewrite of the whole table; a checkpoint step
-   periodically folds the WAL back into the base CSV. This is the direct
-   precursor to M7 (WAL is what also buys concurrent readers) - deferred
-   because the milestone's own text frames it as a distinct follow-on
-   refinement, not a blocker: every autocommit or explicit `COMMIT`
-   already rewrites and durably replaces the touched tables' whole CSV
-   files today, which is correct (if not yet cheap) durability. `wal.c`/
-   `wal.h` are still to be written.
+2. **Follow-on (done, as part of M7): an append-only WAL** of row-level
+   changes, so commit is an `fsync` of a small append rather than a
+   rewrite of the whole table, with a checkpoint step that periodically
+   folds the WAL back into the base CSV. See M7 below for `wal.c`/`wal.h`
+   and how `interp_exec_commit`/`load_csv` were rewired to use it - this
+   is also the direct precursor to M7's reader/writer coordination (a WAL
+   is what makes "readers never block the writer" meaningful).
 
 The txn API (`db4_begin`/`db4_commit`/`db4_rollback`, not yet public - only
 `main.c`'s REPL calls into it, same as every milestone before M8) is solid:
-single-writer correctness including rollback is proven end to end below,
-before M7 concurrency is on the table.
+single-writer correctness including rollback is proven end to end below.
 
 ### M6 — Wider SQL surface — **done**
 
@@ -456,16 +456,55 @@ addition to the AST/lexer/parser and `interp.c`, not a rearchitecture:
   in the select list must be one of the `GROUP BY` columns, same rule
   real SQL enforces.
 
-### M7 — Concurrency: one writer, many readers
+### M7 — Concurrency: one writer, many readers — **done**
 
-Reader-writer lock at the connection/catalog level, backed by the M5 WAL:
-readers see a consistent snapshot (the WAL frames as of when their read
-started, or the base file if the WAL is empty), a single writer appends new
-WAL frames, readers never block the writer and vice versa beyond a brief
-lock to register a reader's snapshot point. This is the "convention" for
-embedded ACID engines under concurrent access (see WAL discussion above) —
-resist the pull toward full MVCC until a concrete workload demands
-concurrent *writers*, not just concurrent readers.
+Builds the WAL that M5 deferred, then the reader/writer lock on top of it,
+in one pass — the lock alone would have had nothing real to coordinate:
+
+- **`wal.c`/`wal.h`**: an append-only log of row-level frames, replacing a
+  whole-table rewrite per commit. Each frame is `{magic, row index, kind,
+  payload_len, checksum, payload}`; `kind` is either a full row (every
+  column's current value, `is_null` bit plus type-specific bytes) or a
+  tombstone (row now dead, no payload). Frames record a row's *absolute*
+  current state, not a delta, so replaying one twice is harmless — that's
+  what makes a torn last frame (a crash mid-`fwrite`) safe to just stop at:
+  `wal_replay` reads frames in order and bails the instant a header's magic
+  doesn't match, a `fread` comes up short, or a checksum fails, keeping
+  everything applied before that point. `interp_exec_commit` (`interp.c`)
+  now walks the still-live undo log *before* clearing it (it already had
+  `table_name`/`row` for exactly this) to build one distinct-row-list per
+  distinct table touched since `BEGIN`, and WAL-appends just those rows —
+  `dump_csv` no longer runs on every commit. `load_csv` (`load.c`) replays
+  `<path>.wal` onto the freshly-loaded base table before handing it to the
+  catalog, so a reload sees every committed change. `wal_checkpoint` folds
+  the WAL into the base CSV via the existing `dump_csv` atomic rewrite,
+  then removes the WAL file — exposed at the REPL as `.checkpoint <table>`,
+  a manual step for now (no size- or time-based auto-checkpoint trigger
+  yet, nothing needs one until a workload shows the WAL growing enough to
+  matter).
+- **`lock.c`/`lock.h`**: an advisory, file-backed reader/writer lock keyed
+  by a table's path (`flock()` on `<path>.lock` — `LOCK_SH` for readers,
+  `LOCK_EX` for writers), the actual cross-*process* coordination M7 asks
+  for. `load_csv` holds a shared lock across the base-file read + WAL
+  replay (concurrent readers stack freely); `commit_wal_for_table`
+  (`interp.c`) and `.checkpoint` each hold an exclusive lock only around
+  their own append or rewrite — bounded and brief, never across a whole
+  session, matching "readers never block the writer and vice versa beyond
+  a brief lock to register a reader's snapshot point."
+
+**Deliberate scope boundary**: db4 has no connection/session object yet
+(that's M8) — each REPL process loads a table once into its own memory and
+keeps it resident for the session, so a concurrent writer's commit isn't
+*visible* to another process's already-open table without that process
+re-`.load`ing. What this milestone actually delivers is the storage-level
+half of "one writer, many readers": commits and checkpoints are now safe
+to interleave across processes sharing the same CSV+WAL files (no torn
+reads, no lost WAL frames), which is the real prerequisite for a live
+multi-reader story once M8's connection API exists to make "stay
+subscribed to new commits" a meaningful thing to ask for. Building that
+live-refresh mechanism now, ahead of having any connection object to hang
+it off of, would be exactly the premature abstraction this plan's guiding
+principles warn against.
 
 ### M8 — Public C API + real page storage
 
@@ -495,8 +534,8 @@ concurrent *writers*, not just concurrent readers.
 | `cursor.c`/`cursor.h` | row iteration over a `Table` (done) | M4 |
 | `interp.c`/`interp.h` | tree-walking query executor (done) | M4 |
 | `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping (done) | M5 |
-| `wal.c`/`wal.h` | append-only write-ahead log, checkpointing | M5 (follow-on, not started) |
-| `lock.c`/`lock.h` | reader/writer coordination | M7 |
+| `wal.c`/`wal.h` | append-only write-ahead log, checkpointing (done) | M5 (follow-on) / M7 |
+| `lock.c`/`lock.h` | reader/writer coordination (done) | M7 |
 | `pager.c`/`pager.h` | fixed-size page file, free list | M8 |
 | `btree.c`/`btree.h` | table/index b-trees over pages | M8 |
 | `db4.h` | public API surface | M8 |

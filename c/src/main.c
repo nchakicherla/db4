@@ -6,9 +6,11 @@
 #include "load.h"
 #include "catalog.h"
 #include "interp.h"
+#include "lock.h"
 #include "parser.h"
 #include "table.h"
 #include "txn.h"
+#include "wal.h"
 
 static const char *skip_spaces(const char *s) {
     while (*s == ' ') s++;
@@ -60,6 +62,48 @@ static void cmd_dump(Catalog *catalog, const char *args) {
 
     if (dump_csv(&catalog->tables[idx].table, path))
         printf("dumped %s to %s\n", name, path);
+}
+
+/* Folds a table's WAL back into its base CSV (M7) - a brief exclusive
+ * lock (see lock.h) excludes concurrent readers' `.load` snapshots and
+ * other writers' commits while the base file is rewritten. */
+static void cmd_checkpoint(Catalog *catalog, const char *args) {
+    char name[MAX_COL_NAME_LEN];
+    const char *p = args;
+    if (!take_word(&p, name, sizeof name)) {
+        printf("usage: .checkpoint <table>\n");
+        return;
+    }
+
+    int idx = catalog_find(catalog, name);
+    if (idx < 0) {
+        printf("no such table: %s\n", name);
+        return;
+    }
+    if (!catalog->tables[idx].path) {
+        printf("table \"%s\" has no backing file to checkpoint\n", name);
+        return;
+    }
+
+    const char *path = catalog->tables[idx].path;
+    char        wal_path[4160];
+    int         n = snprintf(wal_path, sizeof wal_path, "%s.wal", path);
+    if (n < 0 || (size_t)n >= sizeof wal_path) {
+        printf("path too long: %s\n", path);
+        return;
+    }
+
+    Db4Lock lock;
+    lock.fd = -1;
+    bool have_lock = db4_lock_open(&lock, path) && db4_lock_exclusive(&lock);
+
+    bool ok = wal_checkpoint(path, wal_path, &catalog->tables[idx].table);
+
+    if (have_lock) db4_lock_release(&lock);
+    db4_lock_close(&lock);
+
+    if (ok) printf("checkpointed %s\n", name);
+    else printf("checkpoint failed for %s\n", name);
 }
 
 static void cmd_schema(Catalog *catalog, const char *args) {
@@ -132,6 +176,8 @@ static void dispatch(Catalog *catalog, const char *line) {
         cmd_schema(catalog, line + 8);
     } else if (strncmp(line, ".dump ", 6) == 0) {
         cmd_dump(catalog, line + 6);
+    } else if (strncmp(line, ".checkpoint ", 12) == 0) {
+        cmd_checkpoint(catalog, line + 12);
     } else if (strncmp(line, ".parse ", 7) == 0) {
         cmd_parse(line + 7);
     } else {

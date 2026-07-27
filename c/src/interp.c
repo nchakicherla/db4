@@ -6,6 +6,8 @@
 #include "cursor.h"
 #include "field.h"
 #include "load.h"
+#include "lock.h"
+#include "wal.h"
 
 typedef enum {
     ETYPE_INT,
@@ -1327,36 +1329,80 @@ static bool interp_exec_create_table(const CreateTableStmt *stmt, Catalog *catal
     return true;
 }
 
-/* Durability: every table touched since BEGIN gets dump_csv's atomic
- * write-temp/fsync/rename back to the path it was loaded from - "nothing
- * durable until commit" (M5's short-term approach; the WAL follow-on that
- * avoids a whole-table rewrite per commit is still ahead of us). */
+/* WAL-appends one table's share of a commit: every distinct row touched
+ * since BEGIN, at its current in-memory state (see wal.h - a live row's
+ * full columns, or a tombstone). Briefly holds an exclusive lock around
+ * the append (M7) so a concurrent reader's `.load` snapshot (a shared
+ * lock, see load.c) never observes a torn WAL write. */
+static bool commit_wal_for_table(Catalog *catalog, Table *table, const char *table_name,
+                                  const size_t *rows, size_t n_rows, char *err, size_t err_len) {
+    int idx = catalog_find(catalog, table_name);
+    if (idx < 0 || !catalog->tables[idx].path) return true; /* no backing file - nothing to persist */
+
+    const char *path = catalog->tables[idx].path;
+    char        wal_path[4160];
+    int         n = snprintf(wal_path, sizeof wal_path, "%s.wal", path);
+    if (n < 0 || (size_t)n >= sizeof wal_path) {
+        snprintf(err, err_len, "path too long for WAL: %s", path);
+        return false;
+    }
+
+    Db4Lock lock;
+    lock.fd = -1;
+    bool have_lock = db4_lock_open(&lock, path) && db4_lock_exclusive(&lock);
+
+    bool ok = wal_append(wal_path, table, rows, n_rows);
+
+    if (have_lock) db4_lock_release(&lock);
+    db4_lock_close(&lock);
+
+    if (!ok) snprintf(err, err_len, "commit failed: could not append to WAL for \"%s\"", table_name);
+    return ok;
+}
+
+/* Durability: every table touched since BEGIN gets its changed rows
+ * WAL-appended (fsync'd, bounded) rather than a whole-table dump_csv
+ * rewrite - "nothing durable until commit" at a fraction of M5's
+ * short-term cost. `.checkpoint <table>` folds the WAL back into the
+ * base CSV when it's grown enough to be worth compacting. */
 static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err_len) {
     if (!txn->active) {
         snprintf(err, err_len, "no transaction is active");
         return false;
     }
 
-    const char **names = malloc(catalog->count * sizeof(char *));
-    if (!names && catalog->count) {
-        snprintf(err, err_len, "out of memory");
-        return false;
-    }
+    for (size_t i = 0; i < txn->count; i++) {
+        Table      *table      = txn->log[i].table;
+        const char *table_name = txn->log[i].table_name;
 
-    size_t n = txn_commit(txn, names, catalog->count);
+        bool table_seen_before = false;
+        for (size_t j = 0; j < i; j++)
+            if (txn->log[j].table == table) { table_seen_before = true; break; }
+        if (table_seen_before) continue;
 
-    for (size_t i = 0; i < n; i++) {
-        int idx = catalog_find(catalog, names[i]);
-        if (idx < 0) continue;
-        if (!catalog->tables[idx].path) continue;
-        if (!dump_csv(&catalog->tables[idx].table, catalog->tables[idx].path)) {
-            snprintf(err, err_len, "commit failed: could not durably write \"%s\"", names[i]);
-            free(names);
+        size_t *rows = malloc(txn->count * sizeof(size_t));
+        if (!rows) {
+            snprintf(err, err_len, "out of memory");
             return false;
         }
+
+        size_t n_rows = 0;
+        for (size_t j = i; j < txn->count; j++) {
+            if (txn->log[j].table != table) continue;
+            size_t row = txn->log[j].row;
+            bool   dup = false;
+            for (size_t k = 0; k < n_rows; k++)
+                if (rows[k] == row) { dup = true; break; }
+            if (!dup) rows[n_rows++] = row;
+        }
+
+        bool ok = commit_wal_for_table(catalog, table, table_name, rows, n_rows, err, err_len);
+        free(rows);
+        if (!ok) return false;
     }
 
-    free(names);
+    txn->count  = 0;
+    txn->active = false;
     return true;
 }
 

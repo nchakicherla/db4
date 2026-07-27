@@ -61,9 +61,4 @@ bool txn_log_delete(Txn *txn, Table *table, const char *table_name, size_t row);
  * log and deactivates the txn. */
 void txn_rollback(Txn *txn);
 
-/* Clears the log and deactivates the txn, writing up to max distinct
- * table names touched since txn_begin into out_names (for the caller to
- * durably flush) - returns how many it wrote. */
-size_t txn_commit(Txn *txn, const char **out_names, size_t max);
-
 #endif

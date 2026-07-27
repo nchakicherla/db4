@@ -190,6 +190,18 @@ M7 below for the full write-up and its scope boundary (no live
 "see-new-commits-without-reloading" story yet - that needs M8's
 connection object first).
 
+M8's public-API half is that connection object: `db4.h`/`db4.c` freezes
+`db4_open`/`db4_prepare`/`db4_step`/`db4_column_*`/`db4_finalize`/
+`db4_changes`/`db4_errmsg`/`db4_exec`, and `main.c`'s bare-SQL path now
+runs through it instead of calling `parser.c`/`interp.c` directly.
+`interp.c`'s `SELECT` execution had to stop `fprintf`ing a text table
+directly and start materializing a `ResultSet` (`result.h`/`result.c`,
+built from `Value`s now shared via `value.h`/`value.c`) for `db4_step`/
+`db4_column_*` to iterate - `interp_exec` itself lost its `FILE *out` and
+is a pure engine call now. Page storage (replacing CSV+WAL with a
+fixed-size-page file plus b-tree indexes) is the still-outstanding half;
+see M8 below for why it's staying deferred.
+
 ### Stale scaffolding notes
 
 `table_set_foreign_key`/`table_set_primary_key` are now actually enforced
@@ -506,20 +518,56 @@ live-refresh mechanism now, ahead of having any connection object to hang
 it off of, would be exactly the premature abstraction this plan's guiding
 principles warn against.
 
-### M8 — Public C API + real page storage
+### M8 — Public C API + real page storage — **public API done, page storage still ahead**
 
-- Freeze a `db4.h` public header modeled on sqlite3's shape:
-  `db4_open`, `db4_close`, `db4_prepare`, `db4_step`, `db4_column_*`,
-  `db4_finalize`, `db4_exec` (convenience wrapper), `db4_errmsg`.
-  `main.c`'s REPL gets rewritten as a client of this header, proving the
-  library boundary is real rather than main.c reaching into internals.
-- Replace the CSV-file-as-storage model with a fixed-size-page file format
-  (page size, free list, a table b-tree keyed by rowid) once CSV's
-  rewrite-on-commit cost or lack of indexing actually becomes the
-  bottleneck — not preemptively. CSV import/export becomes a feature
-  (`.import`/`.dump`-equivalent) rather than the storage engine itself.
-- Indexes (b-tree on a declared column) become viable once storage is
-  page-based, enabling `WHERE`/join clauses to avoid full scans.
+Split into the two pieces the heading always implied were separable, and
+only the first is built: page storage's own text already frames it as
+conditional ("once CSV's rewrite-on-commit cost... actually becomes the
+bottleneck — not preemptively"), and M7's WAL just addressed exactly that
+cost, so there's nothing concrete yet pushing on it.
+
+- **`db4.h`/`db4.c` (done)**: a public header modeled on sqlite3's
+  open/prepare/step/column/finalize shape - `db4_open`, `db4_close`,
+  `db4_prepare`, `db4_step`, `db4_column_count`/`_name`/`_type`/`_int64`/
+  `_double`/`_bool`/`_text`, `db4_finalize`, `db4_changes`, `db4_errmsg`,
+  and `db4_exec` (a `sqlite3_exec`-alike convenience wrapper: prepare,
+  step to completion, one text-formatted callback per row). `Db4` is a
+  plain exposed struct (a `Catalog` + `Txn` + error/changes state), not an
+  opaque handle - consistent with every other type in this codebase
+  (`Table`/`Catalog`/`Txn` are all fully exposed too); it just saves the
+  caller from wiring the two pieces together by hand. `main.c`'s bare-SQL
+  path (`cmd_sql`) now goes through `db4_prepare`/`db4_step`/`db4_column_*`
+  instead of calling `parser_parse_statement`/`interp_exec` directly - the
+  library boundary is real for the one thing that actually needed proving
+  (SQL execution); the pre-existing `.load`/`.dump`/`.schema`/`.tables`/
+  `.checkpoint` dot-commands still work directly against `Db4`'s embedded
+  `Catalog`, since those were never SQL statements sqlite has an
+  equivalent surface for either.
+  - This forced `interp.c`'s two `SELECT` execution paths
+    (`exec_select_plain`/`exec_select_grouped`) off directly `fprintf`ing
+    a text table and onto materializing a `ResultSet` (`result.h`/
+    `result.c`: column names plus a flat, row-major `Value` array - see
+    `value.h`/`value.c`, `Value`'s new shared home) that `db4_step`/
+    `db4_column_*` iterate row-by-row. `interp_exec` lost its `FILE *out`
+    entirely - it's a pure engine call now, taking an optional
+    `ResultSet *out_rs` and `size_t *out_changes` instead of printing
+    anything itself. Turning that back into human-readable text (the
+    `col | col | col` / row / `(N rows)` format, and `BEGIN`/`COMMIT`/
+    `N rows inserted`-style confirmations) is `main.c`'s job now, driven
+    by `db4_column_*` and `db4_stmt_ast`'s exposed `StmtKind` - not the
+    engine's.
+  - `db4_prepare` parses exactly one statement per call (`out_tail`, if
+    requested, points at the unconsumed remainder - always true EOF today,
+    since this grammar already requires a whole statement to consume the
+    entire input). Nothing chains multiple statements out of one buffer
+    yet; the tail pointer exists because the signature needs it to mean
+    something, not because a caller already relies on it.
+- **Page storage (not started)**: replacing CSV+WAL with a fixed-size-page
+  file format (page size, free list, a table b-tree keyed by rowid), with
+  indexes (b-tree on a declared column) becoming viable once storage is
+  page-based. Still gated on an actual bottleneck showing up - CSV import/
+  export would become a feature (`.import`/`.dump`-equivalent) rather than
+  the storage engine itself whenever this does get built.
 
 ## Module map (new files this plan implies)
 
@@ -536,9 +584,11 @@ principles warn against.
 | `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping (done) | M5 |
 | `wal.c`/`wal.h` | append-only write-ahead log, checkpointing (done) | M5 (follow-on) / M7 |
 | `lock.c`/`lock.h` | reader/writer coordination (done) | M7 |
-| `pager.c`/`pager.h` | fixed-size page file, free list | M8 |
-| `btree.c`/`btree.h` | table/index b-trees over pages | M8 |
-| `db4.h` | public API surface | M8 |
+| `value.h`/`value.c` | shared typed-`Value` currency (moved out of `interp.c`, done) | M8 |
+| `result.h`/`result.c` | `ResultSet` a `SELECT` materializes into (done) | M8 |
+| `db4.h`/`db4.c` | public API surface (done) | M8 |
+| `pager.c`/`pager.h` | fixed-size page file, free list | M8 (not started) |
+| `btree.c`/`btree.h` | table/index b-trees over pages | M8 (not started) |
 
 ## Open questions to resolve as we go (not blocking, but worth flagging)
 

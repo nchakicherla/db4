@@ -7,6 +7,8 @@
 #include "field.h"
 #include "load.h"
 #include "lock.h"
+#include "result.h"
+#include "value.h"
 #include "wal.h"
 
 typedef enum {
@@ -185,62 +187,9 @@ static bool validate_where(const Expr *e, const RowCtx *ctx, char *err, size_t e
     return true;
 }
 
-typedef struct {
-    FieldType kind;
-    bool      is_null;
-    union {
-        int64_t i;
-        double  d;
-        bool    b;
-        struct {
-            const char *data;
-            size_t      len;
-        } s;
-    } as;
-} Value;
-
-static Value value_int(int64_t v)    { Value r; r.kind = FT_INT;    r.is_null = false; r.as.i = v; return r; }
-static Value value_double(double v)  { Value r; r.kind = FT_DOUBLE; r.is_null = false; r.as.d = v; return r; }
-static Value value_bool(bool v)      { Value r; r.kind = FT_BOOL;   r.is_null = false; r.as.b = v; return r; }
-static Value value_text(const char *s, size_t len) {
-    Value r;
-    r.kind = FT_TEXT;
-    r.is_null = false;
-    r.as.s.data = s;
-    r.as.s.len  = len;
-    return r;
-}
-static Value value_null(FieldType kind) { Value r; r.kind = kind; r.is_null = true; return r; }
-
-static Value read_column(const Table *t, size_t row, size_t col) {
-    if (table_is_null(t, row, col)) return value_null(t->types[col]);
-    switch (t->types[col]) {
-        case FT_INT:    return value_int(table_get_int(t, row, col));
-        case FT_DOUBLE: return value_double(table_get_double(t, row, col));
-        case FT_BOOL:   return value_bool(table_get_bool(t, row, col));
-        case FT_TEXT: {
-            size_t len;
-            const char *s = table_get_text(t, row, col, &len);
-            return value_text(s, len);
-        }
-        default: return value_null(FT_TEXT);
-    }
-}
-
-static int compare_values(Value a, Value b) {
-    if ((a.kind == FT_INT || a.kind == FT_DOUBLE) && (b.kind == FT_INT || b.kind == FT_DOUBLE)) {
-        double x = a.kind == FT_INT ? (double)a.as.i : a.as.d;
-        double y = b.kind == FT_INT ? (double)b.as.i : b.as.d;
-        return x < y ? -1 : (x > y ? 1 : 0);
-    }
-    if (a.kind == FT_BOOL) return (int)a.as.b - (int)b.as.b;
-
-    size_t n = a.as.s.len < b.as.s.len ? a.as.s.len : b.as.s.len;
-    int c = n ? memcmp(a.as.s.data, b.as.s.data, n) : 0;
-    if (c != 0) return c;
-    if (a.as.s.len != b.as.s.len) return a.as.s.len < b.as.s.len ? -1 : 1;
-    return 0;
-}
+/* Value/read_column/compare_values now live in value.h/value.c - shared
+ * with db4.c's column accessors and the ResultSet a SELECT materializes
+ * into (result.h). */
 
 /* Three-valued (true/false/unknown) so NULL propagates through AND/OR/NOT
  * the way SQL defines it (e.g. FALSE AND unknown = FALSE, not unknown) -
@@ -361,20 +310,6 @@ static Value eval_value(const Expr *e, const RowCtx *ctx) {
             }
         }
         default: return value_null(FT_TEXT); /* unreachable */
-    }
-}
-
-static void print_value(FILE *f, Value v) {
-    if (v.is_null) {
-        fprintf(f, "NULL");
-        return;
-    }
-    switch (v.kind) {
-        case FT_INT:    fprintf(f, "%lld", (long long)v.as.i); break;
-        case FT_DOUBLE: fprintf(f, "%g", v.as.d); break;
-        case FT_BOOL:   fprintf(f, "%s", v.as.b ? "true" : "false"); break;
-        case FT_TEXT:   fprintf(f, "%.*s", (int)v.as.s.len, v.as.s.data); break;
-        default: break;
     }
 }
 
@@ -512,7 +447,7 @@ static int join_sort_cmp(const void *pa, const void *pb) {
     return g_sort_desc ? -c : c;
 }
 
-static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, FILE *out, char *err, size_t err_len) {
+static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
     size_t n_sources = 1 + stmt->n_joins;
     if (n_sources > MAX_JOIN_SOURCES) {
         snprintf(err, err_len, "too many joined tables (max %d)", MAX_JOIN_SOURCES);
@@ -705,49 +640,65 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, FI
     }
 
     bool qualify_header = n_sources > 1;
-    bool first = true;
-    if (stmt->columns.is_star) {
-        for (size_t s = 0; s < n_sources; s++) {
-            for (size_t c = 0; c < tables[s]->n_cols; c++) {
-                if (!first) fprintf(out, " | ");
-                first = false;
-                if (qualify_header) fprintf(out, "%s.%s", names[s], tables[s]->names[c]);
-                else fprintf(out, "%s", tables[s]->names[c]);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < n_proj; i++) {
-            if (i) fprintf(out, " | ");
-            fprintf(out, "%s", stmt->columns.items[i].column);
-        }
-    }
-    fprintf(out, "\n");
 
-    for (size_t i = 0; i < n_out; i++) {
-        const size_t *tuple = &matched[i * width];
-        first = true;
+    size_t n_cols = n_proj;
+    if (stmt->columns.is_star) {
+        n_cols = 0;
+        for (size_t s = 0; s < n_sources; s++) n_cols += tables[s]->n_cols;
+    }
+
+    Value *row_buf = NULL;
+
+    if (!result_set_init(out_rs, n_cols)) goto oom;
+
+    {
+        size_t k = 0;
+        char   namebuf[192];
         if (stmt->columns.is_star) {
             for (size_t s = 0; s < n_sources; s++) {
                 for (size_t c = 0; c < tables[s]->n_cols; c++) {
-                    if (!first) fprintf(out, " | ");
-                    first = false;
-                    print_value(out, read_column(tables[s], tuple[s], c));
+                    if (qualify_header) snprintf(namebuf, sizeof namebuf, "%s.%s", names[s], tables[s]->names[c]);
+                    else snprintf(namebuf, sizeof namebuf, "%s", tables[s]->names[c]);
+                    if (!result_set_set_col_name(out_rs, k++, namebuf)) goto oom;
                 }
             }
         } else {
-            for (size_t c = 0; c < n_proj; c++) {
-                if (c) fprintf(out, " | ");
-                print_value(out, read_column(tables[proj_src[c]], tuple[proj_src[c]], (size_t)proj_col[c]));
-            }
+            for (size_t i = 0; i < n_proj; i++)
+                if (!result_set_set_col_name(out_rs, k++, stmt->columns.items[i].column)) goto oom;
         }
-        fprintf(out, "\n");
     }
-    fprintf(out, "(%zu row%s)\n", n_out, n_out == 1 ? "" : "s");
 
+    row_buf = malloc(n_cols * sizeof(Value));
+    if (n_cols > 0 && !row_buf) goto oom;
+
+    for (size_t i = 0; i < n_out; i++) {
+        const size_t *tuple = &matched[i * width];
+        size_t k = 0;
+        if (stmt->columns.is_star) {
+            for (size_t s = 0; s < n_sources; s++)
+                for (size_t c = 0; c < tables[s]->n_cols; c++)
+                    row_buf[k++] = read_column(tables[s], tuple[s], c);
+        } else {
+            for (size_t c = 0; c < n_proj; c++)
+                row_buf[k++] = read_column(tables[proj_src[c]], tuple[proj_src[c]], (size_t)proj_col[c]);
+        }
+        if (!result_set_add_row(out_rs, row_buf)) goto oom;
+    }
+
+    free(row_buf);
     free(matched);
     free(proj_src);
     free(proj_col);
     return true;
+
+oom:
+    snprintf(err, err_len, "out of memory");
+    free(row_buf);
+    result_set_free(out_rs);
+    free(matched);
+    free(proj_src);
+    free(proj_col);
+    return false;
 }
 
 /* --- SELECT: GROUP BY / aggregates (single table only) --- */
@@ -783,29 +734,33 @@ static bool group_key_equal(const Table *t, const int *cols, size_t n_cols, size
     return true;
 }
 
-static void print_group_header(FILE *out, const SelectStmt *stmt) {
+static bool build_group_col_names(ResultSet *rs, const SelectStmt *stmt) {
+    char namebuf[192];
     for (size_t i = 0; i < stmt->columns.count; i++) {
-        if (i) fprintf(out, " | ");
         const SelectItem *item = &stmt->columns.items[i];
         if (!item->is_agg) {
-            fprintf(out, "%s", item->column);
-            continue;
+            snprintf(namebuf, sizeof namebuf, "%s", item->column);
+        } else {
+            const char *fname = item->agg_func == AGG_COUNT ? "count" : item->agg_func == AGG_SUM ? "sum" : "avg";
+            if (item->agg_arg_is_star) snprintf(namebuf, sizeof namebuf, "%s(*)", fname);
+            else snprintf(namebuf, sizeof namebuf, "%s(%s)", fname, item->agg_arg_column);
         }
-        const char *fname = item->agg_func == AGG_COUNT ? "count" : item->agg_func == AGG_SUM ? "sum" : "avg";
-        if (item->agg_arg_is_star) fprintf(out, "%s(*)", fname);
-        else fprintf(out, "%s(%s)", fname, item->agg_arg_column);
+        if (!result_set_set_col_name(rs, i, namebuf)) return false;
     }
-    fprintf(out, "\n");
+    return true;
 }
 
-static void print_group_row(FILE *out, const SelectStmt *stmt, const Table *t, const int *item_col,
+static bool build_group_row(ResultSet *rs, const SelectStmt *stmt, const Table *t, const int *item_col,
                              const bool *item_is_group, const size_t *rows, size_t count) {
-    for (size_t i = 0; i < stmt->columns.count; i++) {
-        if (i) fprintf(out, " | ");
+    size_t n_items = stmt->columns.count;
+    Value *row_buf = malloc(n_items * sizeof(Value));
+    if (!row_buf) return false;
+
+    for (size_t i = 0; i < n_items; i++) {
         const SelectItem *item = &stmt->columns.items[i];
 
         if (item_is_group[i]) {
-            print_value(out, count ? read_column(t, rows[0], (size_t)item_col[i]) : value_null(FT_TEXT));
+            row_buf[i] = count ? read_column(t, rows[0], (size_t)item_col[i]) : value_null(FT_TEXT);
             continue;
         }
 
@@ -818,7 +773,7 @@ static void print_group_row(FILE *out, const SelectStmt *stmt, const Table *t, c
                     for (size_t k = 0; k < count; k++)
                         if (!table_is_null(t, rows[k], (size_t)item_col[i])) n++;
                 }
-                print_value(out, value_int(n));
+                row_buf[i] = value_int(n);
                 break;
             }
             case AGG_SUM: {
@@ -832,8 +787,8 @@ static void print_group_row(FILE *out, const SelectStmt *stmt, const Table *t, c
                     if (is_double) dsum += table_get_double(t, rows[k], (size_t)item_col[i]);
                     else            isum += table_get_int(t, rows[k], (size_t)item_col[i]);
                 }
-                if (!any) print_value(out, value_null(is_double ? FT_DOUBLE : FT_INT));
-                else print_value(out, is_double ? value_double(dsum) : value_int(isum));
+                row_buf[i] = !any ? value_null(is_double ? FT_DOUBLE : FT_INT)
+                                  : (is_double ? value_double(dsum) : value_int(isum));
                 break;
             }
             case AGG_AVG: {
@@ -845,15 +800,18 @@ static void print_group_row(FILE *out, const SelectStmt *stmt, const Table *t, c
                     sum += t->types[item_col[i]] == FT_DOUBLE ? table_get_double(t, rows[k], (size_t)item_col[i])
                                                                : (double)table_get_int(t, rows[k], (size_t)item_col[i]);
                 }
-                print_value(out, n == 0 ? value_null(FT_DOUBLE) : value_double(sum / (double)n));
+                row_buf[i] = n == 0 ? value_null(FT_DOUBLE) : value_double(sum / (double)n);
                 break;
             }
         }
     }
-    fprintf(out, "\n");
+
+    bool ok = result_set_add_row(rs, row_buf);
+    free(row_buf);
+    return ok;
 }
 
-static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, FILE *out, char *err, size_t err_len) {
+static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -969,23 +927,31 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
         qsort(rows, n_rows, sizeof(size_t), group_key_cmp);
     }
 
-    print_group_header(out, stmt);
+    if (!result_set_init(out_rs, n_items) || !build_group_col_names(out_rs, stmt)) {
+        snprintf(err, err_len, "out of memory");
+        free(rows);
+        goto fail;
+    }
 
-    size_t n_groups_out = 0;
+    bool built_ok;
     if (stmt->n_group_by == 0) {
-        print_group_row(out, stmt, t, item_col, item_is_group, rows, n_rows);
-        n_groups_out = 1;
+        built_ok = build_group_row(out_rs, stmt, t, item_col, item_is_group, rows, n_rows);
     } else {
+        built_ok = true;
         size_t i = 0;
-        while (i < n_rows) {
+        while (built_ok && i < n_rows) {
             size_t j = i + 1;
             while (j < n_rows && group_key_equal(t, gb_cols, stmt->n_group_by, rows[i], rows[j])) j++;
-            print_group_row(out, stmt, t, item_col, item_is_group, rows + i, j - i);
-            n_groups_out++;
+            built_ok = build_group_row(out_rs, stmt, t, item_col, item_is_group, rows + i, j - i);
             i = j;
         }
     }
-    fprintf(out, "(%zu row%s)\n", n_groups_out, n_groups_out == 1 ? "" : "s");
+    if (!built_ok) {
+        snprintf(err, err_len, "out of memory");
+        result_set_free(out_rs);
+        free(rows);
+        goto fail;
+    }
 
     free(rows);
     free(gb_cols);
@@ -1000,7 +966,7 @@ fail:
     return false;
 }
 
-bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, FILE *out, char *err, size_t err_len) {
+bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
     bool has_agg = false;
     if (!stmt->columns.is_star)
         for (size_t i = 0; i < stmt->columns.count; i++)
@@ -1016,13 +982,13 @@ bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, FILE *ou
         return false;
     }
 
-    if (grouped) return exec_select_grouped(stmt, catalog, out, err, err_len);
-    return exec_select_plain(stmt, catalog, out, err, err_len);
+    if (grouped) return exec_select_grouped(stmt, catalog, out_rs, err, err_len);
+    return exec_select_plain(stmt, catalog, out_rs, err, err_len);
 }
 
 /* --- INSERT / UPDATE / DELETE / CREATE TABLE --- */
 
-static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1100,11 +1066,11 @@ static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *tx
     }
 
     free(cols);
-    fprintf(out, "%zu row%s inserted\n", n_inserted, n_inserted == 1 ? "" : "s");
+    *out_changes = n_inserted;
     return true;
 }
 
-static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1184,11 +1150,11 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
 
     free(cols);
     free(new_vals);
-    fprintf(out, "%zu row%s updated\n", n_updated, n_updated == 1 ? "" : "s");
+    *out_changes = n_updated;
     return true;
 }
 
-static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1216,7 +1182,7 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
         n_deleted++;
     }
 
-    fprintf(out, "%zu row%s deleted\n", n_deleted, n_deleted == 1 ? "" : "s");
+    *out_changes = n_deleted;
     return true;
 }
 
@@ -1408,32 +1374,34 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
 
 /* Dispatches to the right execution path, wrapping a mutation in an
  * implicit BEGIN/COMMIT (or ROLLBACK on failure) when no explicit
- * transaction is already open - autocommit runs silently (no BEGIN/COMMIT
- * feedback), same durability guarantee either way. CREATE TABLE is DDL and
- * runs outside the transaction system entirely (see interp_exec_create_table). */
-bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *err, size_t err_len) {
+ * transaction is already open - autocommit runs silently, same durability
+ * guarantee either way. CREATE TABLE is DDL and runs outside the
+ * transaction system entirely (see interp_exec_create_table).
+ *
+ * Purely an engine call now (M8): no printing happens in here - out_rs
+ * receives a SELECT's rows (untouched for every other statement kind),
+ * out_changes receives INSERT/UPDATE/DELETE's affected-row count (0 for
+ * every other kind). Both are optional (pass NULL to ignore). Turning
+ * this into human-readable output is db4.c/main.c's job now, not the
+ * engine's - see db4.h. */
+bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, ResultSet *out_rs, size_t *out_changes, char *err, size_t err_len) {
+    if (out_changes) *out_changes = 0;
+
     switch (stmt->kind) {
         case STMT_SELECT:
-            return interp_exec_select(&stmt->as.select, catalog, out, err, err_len);
+            return interp_exec_select(&stmt->as.select, catalog, out_rs, err, err_len);
         case STMT_CREATE_TABLE:
-            if (!interp_exec_create_table(&stmt->as.create_table, catalog, err, err_len)) return false;
-            fprintf(out, "table \"%s\" created\n", stmt->as.create_table.table);
-            return true;
+            return interp_exec_create_table(&stmt->as.create_table, catalog, err, err_len);
         case STMT_BEGIN:
-            if (!txn_begin(txn, err, err_len)) return false;
-            fprintf(out, "BEGIN\n");
-            return true;
+            return txn_begin(txn, err, err_len);
         case STMT_COMMIT:
-            if (!interp_exec_commit(catalog, txn, err, err_len)) return false;
-            fprintf(out, "COMMIT\n");
-            return true;
+            return interp_exec_commit(catalog, txn, err, err_len);
         case STMT_ROLLBACK:
             if (!txn->active) {
                 snprintf(err, err_len, "no transaction is active");
                 return false;
             }
             txn_rollback(txn);
-            fprintf(out, "ROLLBACK\n");
             return true;
         case STMT_INSERT:
         case STMT_UPDATE:
@@ -1447,9 +1415,11 @@ bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, FILE *out, char *
                 }
             }
 
-            bool ok = stmt->kind == STMT_INSERT ? interp_exec_insert(&stmt->as.insert, catalog, txn, out, err, err_len)
-                    : stmt->kind == STMT_UPDATE ? interp_exec_update(&stmt->as.update, catalog, txn, out, err, err_len)
-                                                 : interp_exec_delete(&stmt->as.del, catalog, txn, out, err, err_len);
+            size_t changes = 0;
+            bool ok = stmt->kind == STMT_INSERT ? interp_exec_insert(&stmt->as.insert, catalog, txn, &changes, err, err_len)
+                    : stmt->kind == STMT_UPDATE ? interp_exec_update(&stmt->as.update, catalog, txn, &changes, err, err_len)
+                                                 : interp_exec_delete(&stmt->as.del, catalog, txn, &changes, err, err_len);
+            if (out_changes) *out_changes = changes;
 
             if (autocommit) {
                 if (ok) ok = interp_exec_commit(catalog, txn, err, err_len);

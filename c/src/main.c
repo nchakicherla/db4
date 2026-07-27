@@ -2,14 +2,13 @@
 #include <string.h>
 
 #include "arena.h"
+#include "db4.h"
 #include "linenoise.h"
 #include "load.h"
 #include "catalog.h"
-#include "interp.h"
 #include "lock.h"
 #include "parser.h"
 #include "table.h"
-#include "txn.h"
 #include "wal.h"
 
 static const char *skip_spaces(const char *s) {
@@ -143,28 +142,92 @@ static void cmd_parse(const char *args) {
     arena_term(&arena);
 }
 
-/* A bare (non-dot) line is SQL, run against catalog. A mutating statement
- * (INSERT/UPDATE/DELETE) with no transaction already open runs as its own
- * autocommit transaction - see interp_exec. */
-static void cmd_sql(Catalog *catalog, Txn *txn, const char *line) {
-    Arena arena;
-    arena_init(&arena);
+static void print_column_value(Db4Stmt *stmt, int i) {
+    switch (db4_column_type(stmt, i)) {
+        case DB4_NULL: printf("NULL"); break;
+        case DB4_INTEGER: printf("%lld", (long long)db4_column_int64(stmt, i)); break;
+        case DB4_FLOAT: printf("%g", db4_column_double(stmt, i)); break;
+        case DB4_BOOL: printf("%s", db4_column_bool(stmt, i) ? "true" : "false"); break;
+        case DB4_TEXT: {
+            size_t len;
+            const char *s = db4_column_text(stmt, i, &len);
+            printf("%.*s", (int)len, s);
+            break;
+        }
+    }
+}
 
-    Parser parser;
-    parser_init(&parser, line, strlen(line), &arena);
-
-    Stmt *stmt = parser_parse_statement(&parser);
-    if (parser_failed(&parser)) {
-        printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
-        arena_term(&arena);
+/* A bare (non-dot) line is SQL, run through db4.h (M8) rather than
+ * calling parser.c/interp.c directly - main.c is a client of the public
+ * API now, same as any other embedder would be. A mutating statement
+ * (INSERT/UPDATE/DELETE) with no transaction already open still runs as
+ * its own autocommit transaction; that's interp_exec's job underneath,
+ * unchanged. */
+static void cmd_sql(Db4 *db, const char *line) {
+    Db4Stmt *stmt;
+    if (!db4_prepare(db, line, strlen(line), &stmt, NULL)) {
+        printf("%s\n", db4_errmsg(db));
         return;
     }
 
-    char err[128];
-    if (!interp_exec(stmt, catalog, txn, stdout, err, sizeof err))
-        printf("%s\n", err);
+    const Stmt *ast = db4_stmt_ast(stmt);
+    bool is_select = ast->kind == STMT_SELECT;
 
-    arena_term(&arena);
+    int rc = db4_step(stmt);
+    if (rc == DB4_ERROR) {
+        printf("%s\n", db4_errmsg(db));
+        db4_finalize(stmt);
+        return;
+    }
+
+    if (is_select) {
+        int n_cols = db4_column_count(stmt);
+        for (int i = 0; i < n_cols; i++) {
+            if (i) printf(" | ");
+            printf("%s", db4_column_name(stmt, i));
+        }
+        printf("\n");
+
+        size_t n_rows = 0;
+        while (rc == DB4_ROW) {
+            for (int i = 0; i < n_cols; i++) {
+                if (i) printf(" | ");
+                print_column_value(stmt, i);
+            }
+            printf("\n");
+            n_rows++;
+            rc = db4_step(stmt);
+        }
+        if (rc == DB4_ERROR) {
+            printf("%s\n", db4_errmsg(db));
+            db4_finalize(stmt);
+            return;
+        }
+        printf("(%zu row%s)\n", n_rows, n_rows == 1 ? "" : "s");
+    } else {
+        size_t n;
+        switch (ast->kind) {
+            case STMT_CREATE_TABLE: printf("table \"%s\" created\n", ast->as.create_table.table); break;
+            case STMT_BEGIN:        printf("BEGIN\n"); break;
+            case STMT_COMMIT:       printf("COMMIT\n"); break;
+            case STMT_ROLLBACK:     printf("ROLLBACK\n"); break;
+            case STMT_INSERT:
+                n = db4_changes(db);
+                printf("%zu row%s inserted\n", n, n == 1 ? "" : "s");
+                break;
+            case STMT_UPDATE:
+                n = db4_changes(db);
+                printf("%zu row%s updated\n", n, n == 1 ? "" : "s");
+                break;
+            case STMT_DELETE:
+                n = db4_changes(db);
+                printf("%zu row%s deleted\n", n, n == 1 ? "" : "s");
+                break;
+            default: break;
+        }
+    }
+
+    db4_finalize(stmt);
 }
 
 static void dispatch(Catalog *catalog, const char *line) {
@@ -188,9 +251,8 @@ static void dispatch(Catalog *catalog, const char *line) {
 int main(void) {
     linenoiseHistorySetMaxLen(100);
 
-    Catalog catalog = {0};
-    Txn     txn;
-    txn_init(&txn);
+    Db4 db;
+    db4_open(&db);
 
     char *line;
     while ((line = linenoise("db4> ")) != NULL) {
@@ -207,14 +269,13 @@ int main(void) {
         }
 
         if (line[0] == '.') {
-            dispatch(&catalog, line);
+            dispatch(&db.catalog, line);
         } else {
-            cmd_sql(&catalog, &txn, line);
+            cmd_sql(&db, line);
         }
         linenoiseFree(line);
     }
 
-    txn_term(&txn);
-    catalog_term(&catalog);
+    db4_close(&db);
     return 0;
 }

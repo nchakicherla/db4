@@ -5,6 +5,7 @@
 #include "linenoise.h"
 #include "load.h"
 #include "catalog.h"
+#include "interp.h"
 #include "parser.h"
 #include "table.h"
 
@@ -97,6 +98,28 @@ static void cmd_parse(const char *args) {
     arena_term(&arena);
 }
 
+/* A bare (non-dot) line is SQL: M4's executor runs it against catalog. */
+static void cmd_sql(Catalog *catalog, const char *line) {
+    Arena arena;
+    arena_init(&arena);
+
+    Parser parser;
+    parser_init(&parser, line, strlen(line), &arena);
+
+    SelectStmt *stmt = parser_parse_select(&parser);
+    if (parser_failed(&parser)) {
+        printf("line %zu: %s\n", parser_error_line(&parser), parser_error(&parser));
+        arena_term(&arena);
+        return;
+    }
+
+    char err[128];
+    if (!interp_exec_select(stmt, catalog, stdout, err, sizeof err))
+        printf("%s\n", err);
+
+    arena_term(&arena);
+}
+
 static void dispatch(Catalog *catalog, const char *line) {
     if (strncmp(line, ".load ", 6) == 0) {
         load_csv(catalog, line + 6);
@@ -135,7 +158,7 @@ int main(void) {
         if (line[0] == '.') {
             dispatch(&catalog, line);
         } else {
-            printf("%s\n", line);
+            cmd_sql(&catalog, line);
         }
         linenoiseFree(line);
     }

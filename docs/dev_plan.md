@@ -83,20 +83,44 @@ prototype:
   `cascade_on_update`/`check_column_constraints`, which only matter once
   `UPDATE`/`DELETE` exist (M6) — `load.c` only needs `check_row_constraints`,
   used once per freshly-loaded row.
+- [cursor.h](../c/include/cursor.h) / `cursor.c` — **M4's row iterator**: a
+  `Cursor` walks a `Table`'s rows in storage order, skipping tombstoned
+  ones, so `interp.c` doesn't need to know about `table_row_is_dead`
+  itself.
+- [interp.h](../c/include/interp.h) / `interp.c` — **M4's executor**:
+  `interp_exec_select` runs a `SelectStmt` straight off the AST (no
+  planner, no bytecode) against a `Catalog`-held `Table`. Column types are
+  static, so `WHERE`'s type-checking (comparison operand compatibility,
+  `AND`/`OR`/`NOT` operand must be boolean-shaped) is one validation pass
+  before any row is read, not a per-row runtime check. Row matching is
+  three-valued (`true`/`false`/`unknown`), the same as real SQL, so `NULL`
+  propagates correctly through `AND`/`OR`/`NOT` (`FALSE AND unknown` stays
+  `FALSE`; `TRUE OR unknown` stays `TRUE`) instead of being collapsed to a
+  simpler two-valued approximation - only `TRI_TRUE` rows make it through.
+  `ORDER BY` sorts matching row indices with `qsort` (`NULL` sorts first
+  ascending / last descending); `LIMIT` truncates after sorting, since a
+  correct limit has to see the final order first.
 - `main.c` — a linenoise REPL dispatching `.load`, `.tables`, `.schema
-  <table>`, `.dump <table> "<path>"`, `.parse <sql>`, `.quit`/`.exit`.
-  **M1 is done**: verified end to end with multi-table loads, a valid
-  foreign key reference, a rejected foreign key reference (atomic
+  <table>`, `.dump <table> "<path>"`, `.parse <sql>`, `.quit`/`.exit`, and
+  now (M4) a bare (non-dot) line: parsed and run as a `SELECT` against the
+  catalog. **M1 is done**: verified end to end with multi-table loads, a
+  valid foreign key reference, a rejected foreign key reference (atomic
   failure, confirmed the referencing table never got installed), and a
   round-trip dump. **M3 is done**: `.parse` verified against precedence
   (`AND` binding tighter than `OR`), parenthesized/`NOT` subexpressions,
   `''`-escaped string literals, `ORDER BY ... DESC`/`LIMIT`, and four
   distinct malformed-input cases (each latching exactly one error at the
-  right line).
+  right line). **M4 is done**: verified against projection (`*` and
+  explicit column lists), `WHERE` filtering with `AND`/`OR`/`NOT`/parens,
+  static type-checking (`WHERE name = 5` correctly rejected as
+  text-vs-int), unknown table/column errors, `NULL`'s three-valued
+  behavior (`WHERE age = age` correctly excludes a `NULL`-age row instead
+  of treating self-equality as always true), `ORDER BY ... DESC` with a
+  `NULL` value, and `LIMIT`.
 
-Nothing here does transactions or concurrency yet, and nothing runs a
-parsed query against a table yet (M4) — that's the remaining subject of
-this plan.
+Nothing here does transactions or concurrency yet, and nothing beyond
+`SELECT` can be written as SQL yet (M6 adds `INSERT`/`UPDATE`/`DELETE`/
+`CREATE TABLE`) — that's the remaining subject of this plan.
 
 ### Stale scaffolding notes
 
@@ -264,14 +288,16 @@ M3 has no executor to run against yet (M4), so `main.c` grew a `.parse
 latched error) - proof the grammar works standalone, without M4 needing to
 exist first.
 
-### M4 — Execution engine: tree-walking interpreter over cursors
+### M4 — Execution engine: tree-walking interpreter over cursors — **done**
 
-A `Cursor` abstraction iterates a `Table`'s rows; a small interpreter walks
-the AST directly against cursors (filter for WHERE, project for column list,
-in-memory sort for ORDER BY). No query planner yet — one reasonable
-execution order per query shape. This is enough to run real `SELECT`
-queries against loaded CSV tables and is a good place to pause and get
-comfortable before touching durability.
+See "Where things stand" above for [cursor.h](../c/include/cursor.h) /
+`cursor.c` and [interp.h](../c/include/interp.h) / `interp.c`. A bare SQL
+line at the REPL now runs a real `SELECT` against loaded CSV tables: `*`
+or an explicit column projection, `WHERE` with `AND`/`OR`/`NOT`/parens and
+three-valued `NULL` handling, `ORDER BY <col> [ASC|DESC]`, `LIMIT <n>`.
+No query planner yet — one reasonable execution order per query shape
+(filter, then sort, then limit) - and this is a good place to pause and
+get comfortable before touching durability.
 
 ### M5 — Durability: WAL and atomic commit
 
@@ -340,8 +366,8 @@ concurrent *writers*, not just concurrent readers.
 | `lexer.c`/`lexer.h` | SQL tokenizer (done) | M3 |
 | `parser.c`/`parser.h` | recursive-descent parser -> AST (done) | M3 |
 | `ast.h` | AST node types (done) | M3 |
-| `cursor.c`/`cursor.h` | row iteration over a `Table` | M4 |
-| `interp.c`/`interp.h` | tree-walking query executor | M4 |
+| `cursor.c`/`cursor.h` | row iteration over a `Table` (done) | M4 |
+| `interp.c`/`interp.h` | tree-walking query executor (done) | M4 |
 | `txn.c`/`txn.h` | BEGIN/COMMIT/ROLLBACK, undo/redo bookkeeping | M5 |
 | `wal.c`/`wal.h` | append-only write-ahead log, checkpointing | M5 |
 | `lock.c`/`lock.h` | reader/writer coordination | M7 |

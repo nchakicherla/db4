@@ -53,6 +53,31 @@ bool db4_prepare(Db4 *db, const char *sql, size_t sql_len, Db4Stmt **out_stmt, c
  * Txn/Stmt are all fully exposed structs, not hidden behind accessors). */
 const Stmt *db4_stmt_ast(const Db4Stmt *stmt);
 
+/* Number of distinct "?" placeholders parsed in this statement - db4's
+ * equivalent of sqlite3_bind_parameter_count(). Every index from 1 up to
+ * this count is bindable via the db4_bind_* calls below. */
+int db4_bind_parameter_count(const Db4Stmt *stmt);
+
+/* Binds a value to a 1-based "?" placeholder (sqlite3_bind_*'s convention
+ * and index numbering) - lets a caller pass a value into a query without
+ * splicing it into the SQL text, so a value that happens to contain SQL
+ * syntax can never change what statement runs. Every parameter starts
+ * out unbound, which behaves as SQL NULL (matching sqlite3's default) -
+ * bind_null exists for explicitness, not because it's the only way to
+ * get a NULL through. Must be called before the statement's first
+ * db4_step (binding after that has no effect and returns false); each
+ * returns false and fills db4_errmsg on an out-of-range index or a
+ * too-late call.
+ *
+ * db4_bind_text borrows text - like every other TEXT-typed Value in this
+ * codebase (value.h), it is never copied, so the caller's buffer must
+ * stay alive at least through the statement's execution. */
+bool db4_bind_int64(Db4Stmt *stmt, int idx, int64_t v);
+bool db4_bind_double(Db4Stmt *stmt, int idx, double v);
+bool db4_bind_bool(Db4Stmt *stmt, int idx, bool v);
+bool db4_bind_text(Db4Stmt *stmt, int idx, const char *text, size_t len);
+bool db4_bind_null(Db4Stmt *stmt, int idx);
+
 /* Executes the statement (on the first call) or advances to the next row
  * (on later calls, SELECT only). DB4_ROW: a row is ready, read it via
  * db4_column_*. DB4_DONE: no more rows (or the statement never produced

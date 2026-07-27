@@ -147,6 +147,13 @@ static Expr *make_literal_from_token(Parser *p) {
             advance(p);
             return e;
         }
+        case TOK_QUESTION: {
+            Expr *e = new_expr(p, EXPR_PARAM);
+            if (!e) return NULL;
+            e->as.param_index = (int)(++p->param_count);
+            advance(p);
+            return e;
+        }
         default:
             return NULL;
     }
@@ -449,9 +456,10 @@ static bool parse_joins(Parser *p, JoinClause **out_joins, size_t *out_n) {
 void parser_init(Parser *p, const char *sql, size_t len, Arena *a) {
     lexer_init(&p->lexer, sql, len);
     p->arena    = a;
-    p->failed   = false;
-    p->err[0]   = '\0';
-    p->err_line = 0;
+    p->failed      = false;
+    p->err[0]      = '\0';
+    p->err_line    = 0;
+    p->param_count = 0;
 
     p->cur = lexer_next(&p->lexer);
     if (p->cur.type == TOK_ERROR) {
@@ -892,6 +900,7 @@ Stmt *parser_parse_statement(Parser *p) {
             if (p->failed) return NULL;
             stmt->kind      = STMT_SELECT;
             stmt->as.select = *sel;
+            stmt->n_params  = p->param_count;
             return stmt;
         }
         case TOK_INSERT:
@@ -932,6 +941,7 @@ Stmt *parser_parse_statement(Parser *p) {
     if (p->cur.type == TOK_SEMICOLON) advance(p);
     if (!expect(p, TOK_EOF, "end of statement")) return NULL;
 
+    stmt->n_params = p->param_count;
     return stmt;
 }
 
@@ -974,6 +984,9 @@ static void print_expr(FILE *f, const Expr *e) {
             break;
         case EXPR_LIT_NULL:
             fprintf(f, "null");
+            break;
+        case EXPR_PARAM:
+            fprintf(f, "?%d", e->as.param_index);
             break;
         case EXPR_NOT:
             fprintf(f, "(not ");

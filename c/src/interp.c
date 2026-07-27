@@ -56,6 +56,15 @@ typedef struct {
 typedef struct {
     const RowSource *sources;
     size_t           n_sources;
+
+    /* Bound "?" parameter values for this execution (db4_bind_*, via
+     * db4.c's Db4Stmt) - empty/NULL if the statement has none. A
+     * parameter's value is fixed for the whole statement (like a literal),
+     * so resolving EXPR_PARAM's type from the actual bound Value here,
+     * once, is exactly as sound as the existing "check every literal's
+     * type up front" pass - no per-row runtime type check needed. */
+    const Value *params;
+    size_t       n_params;
 } RowCtx;
 
 static bool resolve_column(const RowCtx *ctx, const char *qual_table, const char *col_name,
@@ -114,6 +123,16 @@ static bool infer_expr_type(const Expr *e, const RowCtx *ctx, ExprValueType *out
         case EXPR_LIT_BOOL:   *out = ETYPE_BOOL;   return true;
         case EXPR_LIT_STRING: *out = ETYPE_STRING; return true;
         case EXPR_LIT_NULL:   *out = ETYPE_NULL;   return true;
+        case EXPR_PARAM: {
+            size_t idx = (size_t)e->as.param_index - 1;
+            if (idx >= ctx->n_params) {
+                snprintf(err, err_len, "parameter ?%d is not bound", e->as.param_index);
+                return false;
+            }
+            Value v = ctx->params[idx];
+            *out = v.is_null ? ETYPE_NULL : field_type_to_expr_type(v.kind);
+            return true;
+        }
         case EXPR_NOT: {
             ExprValueType operand;
             if (!infer_expr_type(e->as.unary_operand, ctx, &operand, err, err_len)) return false;
@@ -224,6 +243,7 @@ static Tri eval_tri(const Expr *e, const RowCtx *ctx) {
         case EXPR_LIT_BOOL: return e->as.bool_value ? TRI_TRUE : TRI_FALSE;
         case EXPR_LIT_NULL: return TRI_UNKNOWN;
         case EXPR_COLUMN:   return value_to_tri(eval_value(e, ctx));
+        case EXPR_PARAM:    return value_to_tri(eval_value(e, ctx));
         case EXPR_NEG:      return value_to_tri(eval_value(e, ctx)); /* not a valid predicate post-validation, kept harmless */
         case EXPR_NOT: {
             Tri v = eval_tri(e->as.unary_operand, ctx);
@@ -267,6 +287,7 @@ static Value eval_value(const Expr *e, const RowCtx *ctx) {
         case EXPR_LIT_BOOL:   return value_bool(e->as.bool_value);
         case EXPR_LIT_STRING: return value_text(e->as.string_value.data, e->as.string_value.len);
         case EXPR_LIT_NULL:   return value_null(FT_TEXT);
+        case EXPR_PARAM:      return ctx->params[e->as.param_index - 1];
         case EXPR_NEG: {
             Value v = eval_value(e->as.unary_operand, ctx);
             if (v.is_null) return v;
@@ -447,7 +468,8 @@ static int join_sort_cmp(const void *pa, const void *pb) {
     return g_sort_desc ? -c : c;
 }
 
-static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
+static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, const Value *params, size_t n_params,
+                               ResultSet *out_rs, char *err, size_t err_len) {
     size_t n_sources = 1 + stmt->n_joins;
     if (n_sources > MAX_JOIN_SOURCES) {
         snprintf(err, err_len, "too many joined tables (max %d)", MAX_JOIN_SOURCES);
@@ -484,7 +506,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, Re
 
     RowSource static_sources[MAX_JOIN_SOURCES];
     for (size_t i = 0; i < n_sources; i++) static_sources[i] = (RowSource){ names[i], tables[i], 0 };
-    RowCtx static_ctx = { static_sources, n_sources };
+    RowCtx static_ctx = { static_sources, n_sources, params, n_params };
 
     for (size_t j = 0; j < stmt->n_joins; j++) {
         ExprValueType ty;
@@ -569,7 +591,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, Re
                 RowSource probe[MAX_JOIN_SOURCES];
                 for (size_t s = 0; s < filled; s++) probe[s] = (RowSource){ names[s], tables[s], cur[i * width + s] };
                 probe[filled] = (RowSource){ names[filled], tables[filled], jrow };
-                RowCtx probe_ctx = { probe, filled + 1 };
+                RowCtx probe_ctx = { probe, filled + 1, params, n_params };
 
                 if (eval_tri(stmt->joins[j].on, &probe_ctx) != TRI_TRUE) continue;
 
@@ -603,7 +625,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, Re
         if (stmt->where) {
             RowSource srcs[MAX_JOIN_SOURCES];
             for (size_t s = 0; s < n_sources; s++) srcs[s] = (RowSource){ names[s], tables[s], cur[i * width + s] };
-            RowCtx ctx = { srcs, n_sources };
+            RowCtx ctx = { srcs, n_sources, params, n_params };
             if (eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
         }
         if (n_matched == mcap) {
@@ -811,7 +833,8 @@ static bool build_group_row(ResultSet *rs, const SelectStmt *stmt, const Table *
     return ok;
 }
 
-static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
+static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, const Value *params, size_t n_params,
+                                 ResultSet *out_rs, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -820,7 +843,7 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
     const Table *t = &catalog->tables[t_idx].table;
 
     RowSource src0       = { stmt->table, t, 0 };
-    RowCtx    static_ctx = { &src0, 1 };
+    RowCtx    static_ctx = { &src0, 1, params, n_params };
 
     if (stmt->columns.is_star) {
         snprintf(err, err_len, "SELECT * is not supported with GROUP BY/aggregates - list columns explicitly");
@@ -903,7 +926,7 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
     while (cursor_next(&cur, &row)) {
         if (stmt->where) {
             RowSource s   = { stmt->table, t, row };
-            RowCtx    ctx = { &s, 1 };
+            RowCtx    ctx = { &s, 1, params, n_params };
             if (eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
         }
         if (n_rows == cap) {
@@ -966,7 +989,8 @@ fail:
     return false;
 }
 
-bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, ResultSet *out_rs, char *err, size_t err_len) {
+bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, const Value *params, size_t n_params,
+                         ResultSet *out_rs, char *err, size_t err_len) {
     bool has_agg = false;
     if (!stmt->columns.is_star)
         for (size_t i = 0; i < stmt->columns.count; i++)
@@ -982,13 +1006,14 @@ bool interp_exec_select(const SelectStmt *stmt, const Catalog *catalog, ResultSe
         return false;
     }
 
-    if (grouped) return exec_select_grouped(stmt, catalog, out_rs, err, err_len);
-    return exec_select_plain(stmt, catalog, out_rs, err, err_len);
+    if (grouped) return exec_select_grouped(stmt, catalog, params, n_params, out_rs, err, err_len);
+    return exec_select_plain(stmt, catalog, params, n_params, out_rs, err, err_len);
 }
 
 /* --- INSERT / UPDATE / DELETE / CREATE TABLE --- */
 
-static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
+static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
+                                size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1024,7 +1049,7 @@ static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *tx
         for (size_t i = 0; i < n_target; i++) cols[i] = (int)i;
     }
 
-    RowCtx empty_ctx = {0}; /* VALUES can't reference columns - see expr_has_column_ref below */
+    RowCtx empty_ctx = { NULL, 0, params, n_params }; /* VALUES can't reference columns - see expr_has_column_ref below */
 
     size_t n_inserted = 0;
     for (size_t r = 0; r < stmt->n_rows; r++) {
@@ -1070,7 +1095,8 @@ static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *tx
     return true;
 }
 
-static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
+static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
+                                size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1079,7 +1105,7 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     Table *t = &catalog->tables[t_idx].table;
 
     RowSource src0       = { stmt->table, t, 0 };
-    RowCtx    static_ctx = { &src0, 1 };
+    RowCtx    static_ctx = { &src0, 1, params, n_params };
 
     int *cols = malloc(stmt->n_assignments * sizeof(int));
     Value *new_vals = malloc(stmt->n_assignments * sizeof(Value));
@@ -1120,7 +1146,7 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     size_t row;
     while (cursor_next(&cur, &row)) {
         RowSource src = { stmt->table, t, row };
-        RowCtx    ctx = { &src, 1 };
+        RowCtx    ctx = { &src, 1, params, n_params };
 
         if (stmt->where && eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
 
@@ -1154,7 +1180,8 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     return true;
 }
 
-static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, size_t *out_changes, char *err, size_t err_len) {
+static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
+                                size_t *out_changes, char *err, size_t err_len) {
     int t_idx = catalog_find(catalog, stmt->table);
     if (t_idx < 0) {
         snprintf(err, err_len, "no such table: %s", stmt->table);
@@ -1163,7 +1190,7 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
     Table *t = &catalog->tables[t_idx].table;
 
     RowSource src0       = { stmt->table, t, 0 };
-    RowCtx    static_ctx = { &src0, 1 };
+    RowCtx    static_ctx = { &src0, 1, params, n_params };
     if (stmt->where && !validate_where(stmt->where, &static_ctx, err, err_len)) return false;
 
     size_t n_deleted = 0;
@@ -1172,7 +1199,7 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
     size_t row;
     while (cursor_next(&cur, &row)) {
         RowSource src = { stmt->table, t, row };
-        RowCtx    ctx = { &src, 1 };
+        RowCtx    ctx = { &src, 1, params, n_params };
         if (stmt->where && eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
 
         if (!check_pk_not_referenced(catalog, t, stmt->table, row, err, err_len)) return false;
@@ -1384,12 +1411,13 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
  * every other kind). Both are optional (pass NULL to ignore). Turning
  * this into human-readable output is db4.c/main.c's job now, not the
  * engine's - see db4.h. */
-bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, ResultSet *out_rs, size_t *out_changes, char *err, size_t err_len) {
+bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, const Value *params, size_t n_params,
+                  ResultSet *out_rs, size_t *out_changes, char *err, size_t err_len) {
     if (out_changes) *out_changes = 0;
 
     switch (stmt->kind) {
         case STMT_SELECT:
-            return interp_exec_select(&stmt->as.select, catalog, out_rs, err, err_len);
+            return interp_exec_select(&stmt->as.select, catalog, params, n_params, out_rs, err, err_len);
         case STMT_CREATE_TABLE:
             return interp_exec_create_table(&stmt->as.create_table, catalog, err, err_len);
         case STMT_BEGIN:
@@ -1416,9 +1444,9 @@ bool interp_exec(const Stmt *stmt, Catalog *catalog, Txn *txn, ResultSet *out_rs
             }
 
             size_t changes = 0;
-            bool ok = stmt->kind == STMT_INSERT ? interp_exec_insert(&stmt->as.insert, catalog, txn, &changes, err, err_len)
-                    : stmt->kind == STMT_UPDATE ? interp_exec_update(&stmt->as.update, catalog, txn, &changes, err, err_len)
-                                                 : interp_exec_delete(&stmt->as.del, catalog, txn, &changes, err, err_len);
+            bool ok = stmt->kind == STMT_INSERT ? interp_exec_insert(&stmt->as.insert, catalog, txn, params, n_params, &changes, err, err_len)
+                    : stmt->kind == STMT_UPDATE ? interp_exec_update(&stmt->as.update, catalog, txn, params, n_params, &changes, err, err_len)
+                                                 : interp_exec_delete(&stmt->as.del, catalog, txn, params, n_params, &changes, err, err_len);
             if (out_changes) *out_changes = changes;
 
             if (autocommit) {

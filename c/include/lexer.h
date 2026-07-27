@@ -53,6 +53,7 @@ typedef enum {
     TOK_STAR,
     TOK_COMMA,
     TOK_DOT,
+    TOK_QUESTION,
     TOK_SEMICOLON,
     TOK_LPAREN,
     TOK_RPAREN,

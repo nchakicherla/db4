@@ -21,6 +21,8 @@ typedef struct {
     bool   failed;
     char   err[128];
     size_t err_line;
+
+    size_t param_count; /* "?"s seen so far - becomes the next one's 1-based index */
 } Parser;
 
 void parser_init(Parser *p, const char *sql, size_t len, Arena *a);

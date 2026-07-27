@@ -142,6 +142,7 @@ Token lexer_next(Lexer *lx) {
         case '*': lx->pos++; return make(TOK_STAR, start, 1, line);
         case ',': lx->pos++; return make(TOK_COMMA, start, 1, line);
         case '.': lx->pos++; return make(TOK_DOT, start, 1, line);
+        case '?': lx->pos++; return make(TOK_QUESTION, start, 1, line);
         case ';': lx->pos++; return make(TOK_SEMICOLON, start, 1, line);
         case '(': lx->pos++; return make(TOK_LPAREN, start, 1, line);
         case ')': lx->pos++; return make(TOK_RPAREN, start, 1, line);
@@ -214,6 +215,7 @@ const char *token_type_name(TokenType type) {
         case TOK_STAR:      return "*";
         case TOK_COMMA:     return ",";
         case TOK_DOT:       return ".";
+        case TOK_QUESTION:  return "?";
         case TOK_SEMICOLON: return ";";
         case TOK_LPAREN:    return "(";
         case TOK_RPAREN:    return ")";

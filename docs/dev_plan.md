@@ -573,6 +573,32 @@ cost, so there's nothing concrete yet pushing on it.
     entire input). Nothing chains multiple statements out of one buffer
     yet; the tail pointer exists because the signature needs it to mean
     something, not because a caller already relies on it.
+  - **Parameter binding**: `?` placeholders (`lexer.c`'s `TOK_QUESTION`,
+    `ast.h`'s `EXPR_PARAM`, numbered left-to-right by the parser into a new
+    `Stmt.n_params`) plus `db4_bind_int64`/`_double`/`_bool`/`_text`/`_null`
+    and `db4_bind_parameter_count`, so a caller can pass values into a query
+    without splicing them into the SQL text - the actual point of a
+    prepare/bind/step API, not just following sqlite3's shape for its own
+    sake. `Db4Stmt` owns a `Value` array sized to `n_params`, every slot
+    starting unbound (behaves as SQL `NULL`, sqlite3's default) until a
+    `db4_bind_*` call lands before the first `db4_step`. The interesting
+    part is how `EXPR_PARAM` fits `interp.c`'s existing invariant that one
+    static type-check pass (`infer_expr_type`) proves the whole row-reading
+    pass is type-safe, with no runtime check needed after: a parameter's
+    value is fixed for the whole execution (bound before `db4_step`, never
+    changes mid-statement), so `infer_expr_type` resolves `EXPR_PARAM`'s
+    type from the *actual* bound `Value`'s kind - exactly like a literal -
+    rather than treating it as an untyped wildcard. That's what lets
+    `WHERE int_col = ?` bound to a TEXT value get rejected up front with a
+    clean "cannot compare int and text", instead of reaching
+    `compare_values` with mismatched union members (a real crash risk this
+    design avoids by construction, not by adding a runtime guard).
+    `RowCtx` (every column-resolving/expression-evaluating function's
+    shared context) carries `params`/`n_params` alongside its existing
+    `sources`/`n_sources` for exactly this. `main.c`'s REPL has no bind
+    syntax yet - a bare `?` in a REPL line just stays unbound - so this is
+    reachable today only through `db4.h` directly, same as the rest of the
+    public API's story so far.
 - **Page storage (not started)**: replacing CSV+WAL with a fixed-size-page
   file format (page size, free list, a table b-tree keyed by rowid), with
   indexes (b-tree on a declared column) becoming viable once storage is

@@ -123,6 +123,92 @@ int main(void) {
     CHECK(db4_exec(&db, "SELECT * FROM t", collect_cb, &count), "db4_exec SELECT should succeed");
     CHECK(count == 2, "db4_exec should have invoked callback once per row (2 rows)");
 
+    /* Parameter binding: INSERT VALUES (?, ?), then SELECT ... WHERE col = ? */
+    const char *insert_params_sql = "INSERT INTO t (id, name) VALUES (?, ?)";
+    ok = db4_prepare(&db, insert_params_sql, strlen(insert_params_sql), &stmt, NULL);
+    CHECK(ok, "prepare parameterized INSERT should succeed");
+    if (ok) {
+        CHECK(db4_bind_parameter_count(stmt) == 2, "INSERT should have 2 parameters");
+        CHECK(db4_bind_int64(stmt, 1, 3), "binding id should succeed");
+        CHECK(db4_bind_text(stmt, 2, "carol", 5), "binding name should succeed");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "parameterized INSERT should report DB4_DONE");
+        CHECK(db4_changes(&db) == 1, "1 row should be reported inserted");
+        db4_finalize(stmt);
+    }
+
+    const char *select_param_sql = "SELECT name FROM t WHERE id = ?";
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare parameterized SELECT should succeed");
+    if (ok) {
+        CHECK(db4_bind_int64(stmt, 1, 3), "binding WHERE param should succeed");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_ROW, "parameterized SELECT should find the inserted row");
+        size_t len;
+        const char *txt = db4_column_text(stmt, 0, &len);
+        CHECK(len == 5 && memcmp(txt, "carol", 5) == 0, "row bound by id=3 should be carol");
+        rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "only one row should match id = 3");
+        db4_finalize(stmt);
+    }
+
+    /* An unbound parameter behaves as SQL NULL, same as sqlite3's default */
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_DONE, "id = <unbound NULL> should match no rows (three-valued unknown)");
+        db4_finalize(stmt);
+    }
+
+    /* Binding a text value where the column is INT is a type mismatch,
+     * caught by the same static type check literals already go through -
+     * it must be rejected cleanly, not silently corrupt the row or crash. */
+    ok = db4_prepare(&db, insert_params_sql, strlen(insert_params_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        CHECK(db4_bind_text(stmt, 1, "not-an-int", 10), "bind itself always succeeds");
+        CHECK(db4_bind_text(stmt, 2, "x", 1), "bind itself always succeeds");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_ERROR, "binding text into an INT column should fail at execution");
+        CHECK(strlen(db4_errmsg(&db)) > 0, "errmsg should be set on the type-mismatch failure");
+        db4_finalize(stmt);
+    }
+
+    /* Comparing an INT column against a bound TEXT value must be rejected
+     * up front too - not just column assignment - since eval_comparison
+     * has no runtime type guard of its own (by design: the static check
+     * is supposed to make one unnecessary). */
+    const char *bad_cmp_sql = "SELECT * FROM t WHERE id = ?";
+    ok = db4_prepare(&db, bad_cmp_sql, strlen(bad_cmp_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        CHECK(db4_bind_text(stmt, 1, "nope", 4), "bind itself always succeeds");
+        int rc = db4_step(stmt);
+        CHECK(rc == DB4_ERROR, "comparing int column to a bound text value should fail cleanly");
+        db4_finalize(stmt);
+    }
+
+    /* Out-of-range bind index must fail safely, not crash */
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        CHECK(!db4_bind_int64(stmt, 0, 1), "index 0 is out of range (1-based)");
+        CHECK(!db4_bind_int64(stmt, 2, 1), "index 2 is out of range (only 1 param)");
+        db4_finalize(stmt);
+    }
+
+    /* Binding after the statement has already executed must fail, not
+     * silently do nothing or retroactively change the result. */
+    ok = db4_prepare(&db, select_param_sql, strlen(select_param_sql), &stmt, NULL);
+    CHECK(ok, "prepare should succeed");
+    if (ok) {
+        CHECK(db4_bind_int64(stmt, 1, 3), "first bind should succeed");
+        db4_step(stmt);
+        CHECK(!db4_bind_int64(stmt, 1, 1), "binding after execution should fail");
+        db4_finalize(stmt);
+    }
+
     /* db4_finalize(NULL) must be a safe no-op */
     db4_finalize(NULL);
 

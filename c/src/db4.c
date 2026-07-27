@@ -20,6 +20,16 @@ struct Db4Stmt {
     bool       executed; /* has the first db4_step run the statement yet? */
     bool       failed;
 
+    /* Bound "?" parameter values (db4_bind_*), sized to stmt->n_params -
+     * NULL/0 if the statement has none. Every slot starts out
+     * value_null(FT_TEXT) (unbound behaves as SQL NULL, same as sqlite3)
+     * until a matching db4_bind_* call overwrites it. TEXT binds are
+     * borrowed, not copied - matching Value's existing "never owns
+     * memory" contract (value.h) - so the caller's buffer must stay
+     * alive through db4_step. */
+    Value     *params;
+    size_t     n_params;
+
     ResultSet  rs;      /* valid once executed, for a SELECT */
     size_t     row_idx; /* next row to serve; row_idx - 1 is "current" after DB4_ROW */
 };
@@ -57,6 +67,19 @@ bool db4_prepare(Db4 *db, const char *sql, size_t sql_len, Db4Stmt **out_stmt, c
         return false;
     }
 
+    stmt->n_params = stmt->stmt->n_params;
+    stmt->params   = NULL;
+    if (stmt->n_params > 0) {
+        stmt->params = malloc(stmt->n_params * sizeof(Value));
+        if (!stmt->params) {
+            snprintf(db->errmsg, sizeof db->errmsg, "out of memory");
+            arena_term(&stmt->arena);
+            free(stmt);
+            return false;
+        }
+        for (size_t i = 0; i < stmt->n_params; i++) stmt->params[i] = value_null(FT_TEXT);
+    }
+
     stmt->db        = db;
     stmt->is_select = stmt->stmt->kind == STMT_SELECT;
     stmt->executed  = false;
@@ -90,7 +113,8 @@ static void ensure_executed(Db4Stmt *stmt) {
 
     char   err[256];
     size_t changes = 0;
-    bool   ok = interp_exec(stmt->stmt, &stmt->db->catalog, &stmt->db->txn, &stmt->rs, &changes, err, sizeof err);
+    bool   ok = interp_exec(stmt->stmt, &stmt->db->catalog, &stmt->db->txn, stmt->params, stmt->n_params,
+                             &stmt->rs, &changes, err, sizeof err);
     stmt->db->changes = changes;
 
     if (!ok) {
@@ -116,7 +140,42 @@ void db4_finalize(Db4Stmt *stmt) {
     if (!stmt) return;
     result_set_free(&stmt->rs);
     arena_term(&stmt->arena);
+    free(stmt->params);
     free(stmt);
+}
+
+int db4_bind_parameter_count(const Db4Stmt *stmt) {
+    return (int)stmt->n_params;
+}
+
+/* Shared by every db4_bind_* below: bounds-checks idx (1-based, sqlite3's
+ * convention) and refuses to bind once the statement has already run -
+ * a bind after that point could never take effect, so silently accepting
+ * it would just hide a caller bug. */
+static bool bind_set(Db4Stmt *stmt, int idx, Value v) {
+    if (stmt->executed) {
+        snprintf(stmt->db->errmsg, sizeof stmt->db->errmsg, "cannot bind parameter after the statement has executed");
+        return false;
+    }
+    if (idx < 1 || (size_t)idx > stmt->n_params) {
+        snprintf(stmt->db->errmsg, sizeof stmt->db->errmsg,
+                 "parameter index %d out of range (statement has %zu)", idx, stmt->n_params);
+        return false;
+    }
+    stmt->params[idx - 1] = v;
+    return true;
+}
+
+bool db4_bind_int64(Db4Stmt *stmt, int idx, int64_t v) { return bind_set(stmt, idx, value_int(v)); }
+bool db4_bind_double(Db4Stmt *stmt, int idx, double v) { return bind_set(stmt, idx, value_double(v)); }
+bool db4_bind_bool(Db4Stmt *stmt, int idx, bool v)     { return bind_set(stmt, idx, value_bool(v)); }
+
+bool db4_bind_text(Db4Stmt *stmt, int idx, const char *text, size_t len) {
+    return bind_set(stmt, idx, value_text(text, len));
+}
+
+bool db4_bind_null(Db4Stmt *stmt, int idx) {
+    return bind_set(stmt, idx, value_null(FT_TEXT));
 }
 
 int db4_column_count(Db4Stmt *stmt) {

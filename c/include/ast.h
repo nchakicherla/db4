@@ -17,6 +17,7 @@ typedef enum {
     EXPR_NOT,
     EXPR_NEG,
     EXPR_BINARY,
+    EXPR_PARAM,
 } ExprKind;
 
 typedef enum {
@@ -62,6 +63,8 @@ struct Expr {
             Expr    *left;
             Expr    *right;
         } binary;
+
+        int param_index; /* EXPR_PARAM - 1-based position among this statement's "?"s */
     } as;
 };
 
@@ -179,6 +182,7 @@ typedef enum {
 
 typedef struct {
     StmtKind kind;
+    size_t   n_params; /* count of distinct "?" placeholders parsed in this statement */
     union {
         SelectStmt      select;
         InsertStmt      insert;

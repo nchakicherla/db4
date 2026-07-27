@@ -1,8 +1,13 @@
+#include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 
 #include "arena.h"
 #include "db4.h"
+#include "lexer.h"
 #include "linenoise.h"
 #include "load.h"
 #include "catalog.h"
@@ -248,11 +253,148 @@ static void dispatch(Catalog *catalog, const char *line) {
     }
 }
 
+/* --- Tab completion ---
+ *
+ * linenoise's completion callback (linenoise.h) takes only the buffer,
+ * no user-data pointer, so - same reason interp.c's qsort comparator
+ * reaches its sort state through file-scope statics rather than an
+ * argument - the one Db4 this REPL ever has is reachable through a
+ * file-scope pointer set once in main(), not threaded through. */
+static Db4 *g_completion_db;
+
+static bool ident_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+/* linenoise always completes at the end of the buffer (there's no
+ * mid-line completion support here) - this finds where the identifier-
+ * shaped word ending there begins, so completion can replace just that
+ * trailing word instead of the whole line. */
+static size_t word_start(const char *buf, size_t len) {
+    size_t i = len;
+    while (i > 0 && ident_char(buf[i - 1])) i--;
+    return i;
+}
+
+static void add_completion_word(linenoiseCompletions *lc, const char *buf, size_t start, const char *word) {
+    char full[1024];
+    snprintf(full, sizeof full, "%.*s%s", (int)start, buf, word);
+    linenoiseAddCompletion(lc, full);
+}
+
+static const char *DOT_COMMANDS[] = {
+    ".load", ".tables", ".schema", ".dump", ".checkpoint", ".parse", ".quit", ".exit",
+};
+
+/* Only while the command word itself is still being typed (no space yet)
+ * - completing an argument position is a different job, handled below by
+ * complete_sql_word (table/column names) and complete_filename (paths). */
+static void complete_dot_command(linenoiseCompletions *lc, const char *buf, size_t len) {
+    for (size_t i = 0; i < sizeof(DOT_COMMANDS) / sizeof(DOT_COMMANDS[0]); i++)
+        if (strncmp(DOT_COMMANDS[i], buf, len) == 0) linenoiseAddCompletion(lc, DOT_COMMANDS[i]);
+}
+
+/* SQL keywords (via lexer.c's own table, so the two can't drift) plus
+ * every currently-loaded table and column name. Not scoped to whichever
+ * table a FROM/JOIN/UPDATE already names - that would need real
+ * position-aware parsing of the partial statement; offering the union of
+ * every loaded table's columns is a deliberately simpler approximation.
+ * This same word-completion also ends up serving dot-command arguments
+ * for free (".schema cus<TAB>" completes against table names) since it
+ * doesn't care what precedes the word - only what SQL surface exists. */
+static void complete_sql_word(linenoiseCompletions *lc, const char *buf, size_t start) {
+    const char *word     = buf + start;
+    size_t      word_len = strlen(word);
+    if (word_len == 0) return;
+
+    for (size_t i = 0; i < lexer_keyword_count(); i++) {
+        const char *kw = lexer_keyword_name(i);
+        if (strncasecmp(kw, word, word_len) != 0) continue;
+        char upper[32];
+        size_t n = 0;
+        for (; kw[n] && n + 1 < sizeof upper; n++) upper[n] = (char)toupper((unsigned char)kw[n]);
+        upper[n] = '\0';
+        add_completion_word(lc, buf, start, upper);
+    }
+
+    if (!g_completion_db) return;
+    const Catalog *catalog = &g_completion_db->catalog;
+    for (size_t t = 0; t < catalog->count; t++) {
+        const char *tname = catalog->tables[t].name;
+        if (strncmp(tname, word, word_len) == 0) add_completion_word(lc, buf, start, tname);
+
+        const Table *table = &catalog->tables[t].table;
+        for (size_t c = 0; c < table->n_cols; c++) {
+            const char *cname = table->names[c];
+            if (strncmp(cname, word, word_len) == 0) add_completion_word(lc, buf, start, cname);
+        }
+    }
+}
+
+/* Filename completion inside ".load"/".dump"'s quoted path argument - the
+ * only quoting convention those two commands use (see cmd_dump/load_csv).
+ * "Inside a quote" is approximated as "an odd number of '"' characters
+ * seen so far" rather than a real tokenizer; good enough for the one
+ * quoted argument these commands actually take, and a misfire (e.g. mid-
+ * way through .load's optional quoted JSON schema argument) just yields
+ * no matches rather than anything harmful. */
+static void complete_filename(linenoiseCompletions *lc, const char *buf) {
+    if (strncmp(buf, ".load ", 6) != 0 && strncmp(buf, ".dump ", 6) != 0) return;
+
+    size_t quotes = 0, last_quote = 0;
+    for (size_t i = 0; buf[i]; i++)
+        if (buf[i] == '"') { quotes++; last_quote = i; }
+    if (quotes % 2 == 0) return; /* not currently inside an open quote */
+
+    const char *partial      = buf + last_quote + 1;
+    const char *slash        = strrchr(partial, '/');
+    size_t      dir_len      = slash ? (size_t)(slash - partial) + 1 : 0;
+    const char *fname_prefix = slash ? slash + 1 : partial;
+    size_t      prefix_len   = strlen(fname_prefix);
+
+    char dir_path[768];
+    if (dir_len > 0) snprintf(dir_path, sizeof dir_path, "%.*s", (int)dir_len, partial);
+    else snprintf(dir_path, sizeof dir_path, ".");
+
+    DIR *dp = opendir(dir_path);
+    if (!dp) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        if (strncmp(ent->d_name, fname_prefix, prefix_len) != 0) continue;
+        if (fname_prefix[0] != '.' && ent->d_name[0] == '.') continue; /* hide dotfiles unless asked for */
+
+        char stat_path[900];
+        snprintf(stat_path, sizeof stat_path, "%.*s%s", (int)dir_len, partial, ent->d_name);
+        struct stat st;
+        bool is_dir = stat(stat_path, &st) == 0 && S_ISDIR(st.st_mode);
+
+        char full[1024];
+        snprintf(full, sizeof full, "%.*s%.*s%s%s",
+                 (int)(last_quote + 1), buf, (int)dir_len, partial, ent->d_name, is_dir ? "/" : "");
+        linenoiseAddCompletion(lc, full);
+    }
+    closedir(dp);
+}
+
+static void repl_completion(const char *buf, linenoiseCompletions *lc) {
+    size_t len = strlen(buf);
+
+    if (buf[0] == '.' && strchr(buf, ' ') == NULL) {
+        complete_dot_command(lc, buf, len);
+        return;
+    }
+
+    complete_filename(lc, buf);
+    complete_sql_word(lc, buf, word_start(buf, len));
+}
+
 int main(void) {
     linenoiseHistorySetMaxLen(100);
+    linenoiseSetCompletionCallback(repl_completion);
 
     Db4 db;
     db4_open(&db);
+    g_completion_db = &db;
 
     char *line;
     while ((line = linenoise("db4> ")) != NULL) {

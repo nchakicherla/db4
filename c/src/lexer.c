@@ -50,6 +50,9 @@ static const Keyword KEYWORDS[] = {
     {"group",      TOK_GROUP},
 };
 
+size_t lexer_keyword_count(void) { return sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); }
+const char *lexer_keyword_name(size_t idx) { return KEYWORDS[idx].word; }
+
 static bool ident_start(char c) { return isalpha((unsigned char)c) || c == '_'; }
 static bool ident_char(char c)  { return isalnum((unsigned char)c) || c == '_'; }
 

@@ -94,4 +94,11 @@ Token lexer_next(Lexer *lx);
 
 const char *token_type_name(TokenType type);
 
+/* Read-only access to the lexer's own keyword table (lowercase spellings,
+ * matched case-insensitively at lex time) - lets a caller outside lexer.c
+ * (main.c's tab completion) offer the exact keyword set the grammar
+ * accepts without keeping a second, driftable copy of the list. */
+size_t      lexer_keyword_count(void);
+const char *lexer_keyword_name(size_t idx);
+
 #endif

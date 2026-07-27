@@ -38,6 +38,18 @@ Value read_column(const Table *t, size_t row, size_t col);
 
 int compare_values(Value a, Value b);
 
+/* Only ever meaningful for a non-null Value - hashing a NULL's contents
+ * makes no sense (NULL isn't equal to anything, including another NULL,
+ * in SQL's own terms), so every caller is expected to have already
+ * checked is_null, same discipline table.c already keeps around
+ * indexing (a PK cell is only ever indexed once it's set to a non-null
+ * value - see table_set_int/_double/_bool/_text/_text_ref). Shared by
+ * table.c's own per-cell hashing (backing the PK index) and interp.c's
+ * point-lookup fast path (hashing a WHERE clause's already-evaluated
+ * constant side to probe that same index) - one hash algorithm, not two
+ * copies of the same mixing constants. */
+uint64_t value_hash(Value v);
+
 /* Formats v as text (the same rendering the REPL prints and db4_exec's
  * text-column convenience callback uses) - "NULL" for a null value. */
 void print_value(FILE *f, Value v);

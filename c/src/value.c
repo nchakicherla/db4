@@ -47,6 +47,37 @@ int compare_values(Value a, Value b) {
     return 0;
 }
 
+uint64_t value_hash(Value v) {
+    switch (v.kind) {
+        case FT_INT: {
+            uint64_t x = (uint64_t)v.as.i;
+            x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+            x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+            return x ^ (x >> 31);
+        }
+        case FT_DOUBLE: {
+            double d = v.as.d;
+            if (d == 0.0) d = 0.0; /* normalize -0.0 to hash the same as 0.0 */
+            uint64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            bits ^= bits >> 30; bits *= 0xbf58476d1ce4e5b9ULL;
+            bits ^= bits >> 27; bits *= 0x94d049bb133111ebULL;
+            return bits ^ (bits >> 31);
+        }
+        case FT_BOOL:
+            return v.as.b ? 0x9e3779b97f4a7c15ULL : 0xd6e8feb86659fd93ULL;
+        case FT_TEXT: {
+            uint64_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < v.as.s.len; i++) {
+                h ^= (unsigned char)v.as.s.data[i];
+                h *= 1099511628211ULL;
+            }
+            return h;
+        }
+        default: return 0;
+    }
+}
+
 void print_value(FILE *f, Value v) {
     if (v.is_null) {
         fprintf(f, "NULL");

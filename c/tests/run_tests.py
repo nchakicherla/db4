@@ -458,13 +458,68 @@ def test_m8():
           ["no such table"])
 
 
+# ---------------------------------------------------------------------------
+# PK index point lookups: exec_select_plain uses the existing pk_index
+# (built for constraint enforcement, table.c) to seed a single-table
+# WHERE-pk-equality query's candidate rows instead of a full scan. Every
+# case here is a correctness check, not a performance one - the fast path
+# is only supposed to narrow candidates, with the full WHERE re-evaluated
+# per candidate exactly as a full scan would, so the two scenarios that
+# actually risk a wrong (not just slow) result are a stale index entry
+# left behind by DELETE or by UPDATE-ing the PK column away - covered
+# below in a single REPL session each, since a fresh `.load` would just
+# rebuild the index from scratch and never exercise the staleness at all.
+# ---------------------------------------------------------------------------
+
+def test_pk_index_lookup():
+    d = fresh_tmp("pk_index_basic")
+    check("PK index: WHERE id = <literal> finds the right row", d,
+          [LOAD_CUSTOMERS_PK, 'SELECT name FROM customers WHERE id = 2', '.quit'],
+          ["Bob", "(1 row)"])
+
+    d = fresh_tmp("pk_index_reversed")
+    check("PK index: reversed operand order (<literal> = id)", d,
+          [LOAD_CUSTOMERS_PK, 'SELECT name FROM customers WHERE 2 = id', '.quit'],
+          ["Bob", "(1 row)"])
+
+    d = fresh_tmp("pk_index_and_conjunct")
+    check("PK index: AND-conjunct alongside a non-PK filter still applies the whole WHERE", d,
+          [LOAD_CUSTOMERS_PK, "SELECT name FROM customers WHERE id = 1 AND age > 100", '.quit'],
+          [not_("Alice"), "(0 rows)"])
+
+    d = fresh_tmp("pk_index_no_match")
+    check("PK index: a PK value with no matching row returns nothing, not a crash", d,
+          [LOAD_CUSTOMERS_PK, 'SELECT name FROM customers WHERE id = 999', '.quit'],
+          ["(0 rows)"])
+
+    d = fresh_tmp("pk_index_stale_delete")
+    check("PK index: stale index entry after DELETE is filtered, not returned", d,
+          [LOAD_CUSTOMERS_PK,
+           'DELETE FROM customers WHERE id = 2',
+           'SELECT name FROM customers WHERE id = 2',
+           '.quit'],
+          ["1 row deleted", "(0 rows)", not_("Bob")])
+
+    d = fresh_tmp("pk_index_stale_update")
+    check("PK index: stale index entry after UPDATE-ing the PK away doesn't resurrect the old row", d,
+          [LOAD_CUSTOMERS_PK,
+           'UPDATE customers SET id = 99 WHERE id = 2',
+           'SELECT name FROM customers WHERE id = 2',
+           'SELECT name FROM customers WHERE id = 99',
+           '.quit'],
+          ["1 row updated", "(0 rows)", "(1 row)",
+           lambda o: (o.count("Bob") == 1,
+                      f"expected 'Bob' exactly once (only from the id=99 query) - "
+                      f"the stale id=2 index entry must not resurrect the old row, found {o.count('Bob')}")])
+
+
 def main():
     if not os.path.exists(BIN):
         print(f"binary not found at {BIN}; run `make` first", file=sys.stderr)
         sys.exit(2)
     os.makedirs(TMP, exist_ok=True)
 
-    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8]:
+    for fn in [test_m1, test_m2, test_m3, test_m4, test_m5, test_m6, test_m7, test_m8, test_pk_index_lookup]:
         try:
             fn()
         except AssertionError as e:

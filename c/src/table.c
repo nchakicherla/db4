@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "value.h"
+
 static void table_misuse(Table *t, const char *msg) {
 #ifndef NDEBUG
     fprintf(stderr, "db4: %s\n", msg);
@@ -413,37 +415,11 @@ static bool cell_equal(const Table *ta, size_t row_a, size_t col_a,
     }
 }
 
+/* The mixing algorithm itself now lives in value.c's value_hash, shared
+ * with interp.c's PK point-lookup fast path - this is just read_column
+ * plus that shared hash, not a second copy of the constants. */
 static uint64_t cell_hash(const Table *t, size_t row, size_t col) {
-    switch (t->types[col]) {
-        case FT_INT: {
-            uint64_t x = (uint64_t)table_get_int(t, row, col);
-            x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
-            x ^= x >> 27; x *= 0x94d049bb133111ebULL;
-            return x ^ (x >> 31);
-        }
-        case FT_DOUBLE: {
-            double d = table_get_double(t, row, col);
-            if (d == 0.0) d = 0.0;
-            uint64_t bits;
-            memcpy(&bits, &d, sizeof bits);
-            bits ^= bits >> 30; bits *= 0xbf58476d1ce4e5b9ULL;
-            bits ^= bits >> 27; bits *= 0x94d049bb133111ebULL;
-            return bits ^ (bits >> 31);
-        }
-        case FT_BOOL:
-            return table_get_bool(t, row, col) ? 0x9e3779b97f4a7c15ULL : 0xd6e8feb86659fd93ULL;
-        case FT_TEXT: {
-            size_t len;
-            const char *s = table_get_text(t, row, col, &len);
-            uint64_t h = 14695981039346656037ULL;
-            for (size_t i = 0; i < len; i++) {
-                h ^= (unsigned char)s[i];
-                h *= 1099511628211ULL;
-            }
-            return h;
-        }
-        default: return 0;
-    }
+    return value_hash(read_column(t, row, col));
 }
 
 static void index_row_if_primary_key(Table *t, size_t row, size_t col) {

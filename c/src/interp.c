@@ -443,6 +443,74 @@ static void assign_value(Table *t, size_t row, size_t col, Value v) {
 
 /* --- SELECT: plain projection, joins, ORDER BY, LIMIT --- */
 
+/* Recognizes a top-level "pk_col = <const>" or "<const> = pk_col"
+ * conjunct inside a WHERE tree built from top-level ANDs - e.g. "id = 5",
+ * or "id = ? AND active = true". <const> is any expression with no
+ * column reference (expr_has_column_ref) - a literal, a bound parameter,
+ * or arithmetic over those all qualify, since all of them evaluate to
+ * the same Value on every row.
+ *
+ * Finding one lets exec_select_plain seed its candidate row set from the
+ * table's existing PK hash index (table.c's pk_index, built for
+ * constraint enforcement, not previously used for query execution)
+ * instead of a full Cursor scan - a targeted point-lookup fast path, not
+ * a general query planner (this codebase's long-standing "one reasonable
+ * execution order per query shape, not a planner" stance - see M4/M6 in
+ * dev_plan.md). It only ever narrows the *candidate set*: the full WHERE
+ * still gets evaluated per candidate exactly as it would after a full
+ * scan, so a hash collision or a stale index entry (table.c never
+ * removes an old hash's slot when a PK cell is overwritten or a row is
+ * tombstoned - see cell_hash's callers) can only produce a spurious
+ * candidate that gets filtered out downstream, never a missed real
+ * match. ctx is only used for its params/n_params (a WHERE clause here
+ * refers to exactly one table, and <const>'s definition already rules
+ * out a column reference into it). */
+static bool find_pk_equality(const Expr *e, const RowCtx *ctx, const char *pk_name, Value *out) {
+    if (e->kind == EXPR_BINARY && e->as.binary.op == OP_AND)
+        return find_pk_equality(e->as.binary.left, ctx, pk_name, out) ||
+               find_pk_equality(e->as.binary.right, ctx, pk_name, out);
+
+    if (e->kind != EXPR_BINARY || e->as.binary.op != OP_EQ) return false;
+
+    const Expr *col_side, *const_side;
+    if (e->as.binary.left->kind == EXPR_COLUMN && !expr_has_column_ref(e->as.binary.right)) {
+        col_side   = e->as.binary.left;
+        const_side = e->as.binary.right;
+    } else if (e->as.binary.right->kind == EXPR_COLUMN && !expr_has_column_ref(e->as.binary.left)) {
+        col_side   = e->as.binary.right;
+        const_side = e->as.binary.left;
+    } else {
+        return false;
+    }
+
+    if (col_side->as.column.table && strcmp(col_side->as.column.table, ctx->sources[0].alias) != 0) return false;
+    if (strcmp(col_side->as.column.name, pk_name) != 0) return false;
+
+    Value v = eval_value(const_side, ctx);
+    if (v.is_null) return false; /* "pk = NULL" is never TRI_TRUE - nothing to look up */
+    *out = v;
+    return true;
+}
+
+typedef struct {
+    size_t *rows;
+    size_t  count, cap;
+    bool    oom;
+} PkLookupRows;
+
+static bool collect_pk_row(void *ctx_, size_t row) {
+    PkLookupRows *ctx = ctx_;
+    if (ctx->count == ctx->cap) {
+        size_t  new_cap = ctx->cap ? ctx->cap * 2 : 4;
+        size_t *grown   = realloc(ctx->rows, new_cap * sizeof(size_t));
+        if (!grown) { ctx->oom = true; return false; }
+        ctx->rows = grown;
+        ctx->cap  = new_cap;
+    }
+    ctx->rows[ctx->count++] = row;
+    return true;
+}
+
 #define MAX_JOIN_SOURCES 8
 
 /* qsort has no portable reentrant form in C11, and exec is synchronous and
@@ -557,25 +625,68 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
     size_t *cur = NULL;
     size_t  cur_count = 0, cur_cap = 0;
 
-    Cursor c0;
-    cursor_init(&c0, tables[0]);
-    size_t row0;
-    while (cursor_next(&c0, &row0)) {
-        if (cur_count == cur_cap) {
-            size_t new_cap = cur_cap ? cur_cap * 2 : 16;
-            size_t *grown = realloc(cur, new_cap * width * sizeof(size_t));
-            if (!grown) {
-                snprintf(err, err_len, "out of memory");
-                free(cur);
-                free(proj_src);
-                free(proj_col);
-                return false;
-            }
-            cur     = grown;
-            cur_cap = new_cap;
+    Value pk_lookup_value = value_null(FT_TEXT);
+    bool  use_pk_lookup   = n_sources == 1 && tables[0]->pk_col >= 0 && stmt->where
+                          && row_index_usable(&tables[0]->pk_index)
+                          && find_pk_equality(stmt->where, &static_ctx, tables[0]->names[tables[0]->pk_col], &pk_lookup_value);
+
+    if (use_pk_lookup) {
+        /* Point lookup: probe the PK index instead of scanning every row.
+         * See find_pk_equality's doc comment for why a hash collision or
+         * a stale index entry can't produce a wrong result here - the
+         * WHERE re-check below (the same one a full scan already goes
+         * through) is still the source of truth. */
+        PkLookupRows collected = {0};
+        row_index_find(&tables[0]->pk_index, value_hash(pk_lookup_value), &collected, collect_pk_row);
+        if (collected.oom) {
+            snprintf(err, err_len, "out of memory");
+            free(collected.rows);
+            free(proj_src);
+            free(proj_col);
+            return false;
         }
-        cur[cur_count * width + 0] = row0;
-        cur_count++;
+        for (size_t i = 0; i < collected.count; i++) {
+            size_t row = collected.rows[i];
+            if (table_row_is_dead(tables[0], row)) continue;
+            if (cur_count == cur_cap) {
+                size_t new_cap = cur_cap ? cur_cap * 2 : 4;
+                size_t *grown = realloc(cur, new_cap * width * sizeof(size_t));
+                if (!grown) {
+                    snprintf(err, err_len, "out of memory");
+                    free(collected.rows);
+                    free(cur);
+                    free(proj_src);
+                    free(proj_col);
+                    return false;
+                }
+                cur     = grown;
+                cur_cap = new_cap;
+            }
+            cur[cur_count * width + 0] = row;
+            cur_count++;
+        }
+        free(collected.rows);
+    } else {
+        Cursor c0;
+        cursor_init(&c0, tables[0]);
+        size_t row0;
+        while (cursor_next(&c0, &row0)) {
+            if (cur_count == cur_cap) {
+                size_t new_cap = cur_cap ? cur_cap * 2 : 16;
+                size_t *grown = realloc(cur, new_cap * width * sizeof(size_t));
+                if (!grown) {
+                    snprintf(err, err_len, "out of memory");
+                    free(cur);
+                    free(proj_src);
+                    free(proj_col);
+                    return false;
+                }
+                cur     = grown;
+                cur_cap = new_cap;
+            }
+            cur[cur_count * width + 0] = row0;
+            cur_count++;
+        }
     }
 
     for (size_t j = 0; j < stmt->n_joins; j++) {

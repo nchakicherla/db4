@@ -251,8 +251,8 @@ bool table_drop_column(Table *t, size_t col) {
     return true;
 }
 
-size_t table_append_row(Table *t) {
-    if (t->n_rows == t->row_cap && !table_grow(t)) return SIZE_MAX;
+RowRef table_append_row(Table *t) {
+    if (t->n_rows == t->row_cap && !table_grow(t)) return ROW_REF_INVALID;
 
     size_t row = t->n_rows++;
     for (size_t i = 0; i < t->n_cols; i++) {
@@ -261,10 +261,11 @@ size_t table_append_row(Table *t) {
         null_set(t, i, row);
     }
     dead_clear(t, row);
-    return row;
+    return row_ref(row);
 }
 
-void table_delete_row(Table *t, size_t row) {
+void table_delete_row(Table *t, RowRef row_) {
+    size_t row = row_ref_raw(row_);
     if (dead_test(t, row)) return;
     dead_set(t, row);
     t->n_dead++;
@@ -272,43 +273,48 @@ void table_delete_row(Table *t, size_t row) {
 
 /* Undoes table_delete_row - used by txn.c to roll back a DELETE, not part
  * of any SQL-visible operation. */
-void table_undelete_row(Table *t, size_t row) {
+void table_undelete_row(Table *t, RowRef row_) {
+    size_t row = row_ref_raw(row_);
     if (!dead_test(t, row)) return;
     dead_clear(t, row);
     t->n_dead--;
 }
 
-bool table_row_is_dead(const Table *t, size_t row) {
-    return dead_test(t, row);
+bool table_row_is_dead(const Table *t, RowRef row) {
+    return dead_test(t, row_ref_raw(row));
 }
 
-void table_set_null(Table *t, size_t row, size_t col) {
-    null_set(t, col, row);
+void table_set_null(Table *t, RowRef row, size_t col) {
+    null_set(t, col, row_ref_raw(row));
 }
 
-bool table_is_null(const Table *t, size_t row, size_t col) {
-    return null_test(t, col, row);
+bool table_is_null(const Table *t, RowRef row, size_t col) {
+    return null_test(t, col, row_ref_raw(row));
 }
 
-void table_set_int(Table *t, size_t row, size_t col, int64_t v) {
+void table_set_int(Table *t, RowRef row_, size_t col, int64_t v) {
+    size_t row = row_ref_raw(row_);
     ((int64_t *)t->columns[col])[row] = v;
     null_clear(t, col, row);
     index_row_if_primary_key(t, row, col);
 }
 
-void table_set_double(Table *t, size_t row, size_t col, double v) {
+void table_set_double(Table *t, RowRef row_, size_t col, double v) {
+    size_t row = row_ref_raw(row_);
     ((double *)t->columns[col])[row] = v;
     null_clear(t, col, row);
     index_row_if_primary_key(t, row, col);
 }
 
-void table_set_bool(Table *t, size_t row, size_t col, bool v) {
+void table_set_bool(Table *t, RowRef row_, size_t col, bool v) {
+    size_t row = row_ref_raw(row_);
     ((bool *)t->columns[col])[row] = v;
     null_clear(t, col, row);
     index_row_if_primary_key(t, row, col);
 }
 
-void table_set_text(Table *t, size_t row, size_t col, const char *s, size_t len) {
+void table_set_text(Table *t, RowRef row_, size_t col, const char *s, size_t len) {
+    size_t row = row_ref_raw(row_);
     if (len > UINT32_MAX) {
         arena_fail(&t->heap, ARENA_FAIL_OOM);
         return;
@@ -326,29 +332,30 @@ void table_set_text(Table *t, size_t row, size_t col, const char *s, size_t len)
     index_row_if_primary_key(t, row, col);
 }
 
-int64_t table_get_int(const Table *t, size_t row, size_t col) {
-    return ((int64_t *)t->columns[col])[row];
+int64_t table_get_int(const Table *t, RowRef row, size_t col) {
+    return ((int64_t *)t->columns[col])[row_ref_raw(row)];
 }
 
-double table_get_double(const Table *t, size_t row, size_t col) {
-    return ((double *)t->columns[col])[row];
+double table_get_double(const Table *t, RowRef row, size_t col) {
+    return ((double *)t->columns[col])[row_ref_raw(row)];
 }
 
-bool table_get_bool(const Table *t, size_t row, size_t col) {
-    return ((bool *)t->columns[col])[row];
+bool table_get_bool(const Table *t, RowRef row, size_t col) {
+    return ((bool *)t->columns[col])[row_ref_raw(row)];
 }
 
-const char *table_get_text(const Table *t, size_t row, size_t col, size_t *out_len) {
-    StringRef ref = ((StringRef *)t->columns[col])[row];
+const char *table_get_text(const Table *t, RowRef row, size_t col, size_t *out_len) {
+    StringRef ref = ((StringRef *)t->columns[col])[row_ref_raw(row)];
     *out_len = ref.len;
     return t->heap_data ? t->heap_data + ref.offset : "";
 }
 
-StringRef table_get_text_ref(const Table *t, size_t row, size_t col) {
-    return ((StringRef *)t->columns[col])[row];
+StringRef table_get_text_ref(const Table *t, RowRef row, size_t col) {
+    return ((StringRef *)t->columns[col])[row_ref_raw(row)];
 }
 
-void table_set_text_ref(Table *t, size_t row, size_t col, StringRef ref) {
+void table_set_text_ref(Table *t, RowRef row_, size_t col, StringRef ref) {
+    size_t row = row_ref_raw(row_);
     ((StringRef *)t->columns[col])[row] = ref;
     null_clear(t, col, row);
     index_row_if_primary_key(t, row, col);
@@ -391,8 +398,8 @@ void table_set_primary_key(Table *t, size_t col) {
     t->pk_col = (int)col;
 
     for (size_t r = 0; r < t->n_rows; r++) {
-        if (dead_test(t, r) || table_is_null(t, r, col)) continue;
-        row_index_insert(&t->pk_index, &t->arena, cell_hash(t, r, col), r);
+        if (dead_test(t, r) || table_is_null(t, row_ref(r), col)) continue;
+        row_index_insert(&t->pk_index, &t->arena, cell_hash(t, r, col), row_ref(r));
     }
 }
 
@@ -400,16 +407,21 @@ bool table_is_primary_key(const Table *t, size_t col) {
     return t->is_pk[col];
 }
 
+/* Internal helpers below this point work in raw size_t row numbers - the
+ * storage engine's own arithmetic on its current array-of-rows
+ * representation - and wrap/unwrap at RowRef only where they call back
+ * into this file's public row-taking API (which speaks RowRef, per
+ * docs/persistence_progression.md's Stage 0). */
 static bool cell_equal(const Table *ta, size_t row_a, size_t col_a,
                         const Table *tb, size_t row_b, size_t col_b) {
     switch (ta->types[col_a]) {
-        case FT_INT:    return table_get_int(ta, row_a, col_a) == table_get_int(tb, row_b, col_b);
-        case FT_DOUBLE: return table_get_double(ta, row_a, col_a) == table_get_double(tb, row_b, col_b);
-        case FT_BOOL:   return table_get_bool(ta, row_a, col_a) == table_get_bool(tb, row_b, col_b);
+        case FT_INT:    return table_get_int(ta, row_ref(row_a), col_a) == table_get_int(tb, row_ref(row_b), col_b);
+        case FT_DOUBLE: return table_get_double(ta, row_ref(row_a), col_a) == table_get_double(tb, row_ref(row_b), col_b);
+        case FT_BOOL:   return table_get_bool(ta, row_ref(row_a), col_a) == table_get_bool(tb, row_ref(row_b), col_b);
         case FT_TEXT: {
             size_t len_a, len_b;
-            const char *sa = table_get_text(ta, row_a, col_a, &len_a);
-            const char *sb = table_get_text(tb, row_b, col_b, &len_b);
+            const char *sa = table_get_text(ta, row_ref(row_a), col_a, &len_a);
+            const char *sb = table_get_text(tb, row_ref(row_b), col_b, &len_b);
             return len_a == len_b && memcmp(sa, sb, len_a) == 0;
         }
         default: return false;
@@ -420,12 +432,12 @@ static bool cell_equal(const Table *ta, size_t row_a, size_t col_a,
  * with interp.c's PK point-lookup fast path - this is just read_column
  * plus that shared hash, not a second copy of the constants. */
 static uint64_t cell_hash(const Table *t, size_t row, size_t col) {
-    return value_hash(read_column(t, row, col));
+    return value_hash(read_column(t, row_ref(row), col));
 }
 
 static void index_row_if_primary_key(Table *t, size_t row, size_t col) {
     if (t->pk_col != (int)col) return;
-    row_index_insert(&t->pk_index, &t->arena, cell_hash(t, row, col), row);
+    row_index_insert(&t->pk_index, &t->arena, cell_hash(t, row, col), row_ref(row));
 }
 
 typedef struct {
@@ -434,15 +446,17 @@ typedef struct {
     bool         found;
 } DupCtx;
 
-static bool dup_visit(void *ctx_, size_t r) {
+static bool dup_visit(void *ctx_, RowRef r_) {
     DupCtx *ctx = ctx_;
-    if (r == ctx->row || dead_test(ctx->t, r) || table_is_null(ctx->t, r, ctx->col)) return true;
+    size_t  r   = row_ref_raw(r_);
+    if (r == ctx->row || dead_test(ctx->t, r) || table_is_null(ctx->t, r_, ctx->col)) return true;
     if (cell_equal(ctx->t, ctx->row, ctx->col, ctx->t, r, ctx->col)) { ctx->found = true; return false; }
     return true;
 }
 
-bool table_column_has_duplicate(const Table *t, size_t col, size_t row) {
-    if (table_is_null(t, row, col)) return false;
+bool table_column_has_duplicate(const Table *t, size_t col, RowRef row_) {
+    size_t row = row_ref_raw(row_);
+    if (table_is_null(t, row_, col)) return false;
 
     if (t->pk_col == (int)col && row_index_usable(&t->pk_index)) {
         DupCtx ctx = { t, row, col, false };
@@ -451,7 +465,7 @@ bool table_column_has_duplicate(const Table *t, size_t col, size_t row) {
     }
 
     for (size_t r = 0; r < t->n_rows; r++) {
-        if (r == row || dead_test(t, r) || table_is_null(t, r, col)) continue;
+        if (r == row || dead_test(t, r) || table_is_null(t, row_ref(r), col)) continue;
         if (cell_equal(t, row, col, t, r, col)) return true;
     }
     return false;
@@ -465,15 +479,17 @@ typedef struct {
     bool         found;
 } MatchCtx;
 
-static bool match_visit(void *ctx_, size_t r) {
+static bool match_visit(void *ctx_, RowRef r_) {
     MatchCtx *ctx = ctx_;
-    if (dead_test(ctx->ref_t, r) || table_is_null(ctx->ref_t, r, ctx->ref_col)) return true;
+    size_t    r   = row_ref_raw(r_);
+    if (dead_test(ctx->ref_t, r) || table_is_null(ctx->ref_t, r_, ctx->ref_col)) return true;
     if (cell_equal(ctx->ref_t, r, ctx->ref_col, ctx->t, ctx->row, ctx->col)) { ctx->found = true; return false; }
     return true;
 }
 
-bool table_has_matching_value(const Table *ref_t, size_t ref_col, const Table *t, size_t row, size_t col) {
+bool table_has_matching_value(const Table *ref_t, size_t ref_col, const Table *t, RowRef row_, size_t col) {
     if (ref_t->types[ref_col] != t->types[col]) return false;
+    size_t row = row_ref_raw(row_);
 
     if (ref_t->pk_col == (int)ref_col && row_index_usable(&ref_t->pk_index)) {
         MatchCtx ctx = { ref_t, ref_col, t, row, col, false };
@@ -482,22 +498,35 @@ bool table_has_matching_value(const Table *ref_t, size_t ref_col, const Table *t
     }
 
     for (size_t r = 0; r < ref_t->n_rows; r++) {
-        if (dead_test(ref_t, r) || table_is_null(ref_t, r, ref_col)) continue;
+        if (dead_test(ref_t, r) || table_is_null(ref_t, row_ref(r), ref_col)) continue;
         if (cell_equal(ref_t, r, ref_col, t, row, col)) return true;
     }
     return false;
 }
 
-void table_find_matching_rows(const Table *t, size_t col, const Table *val_t, size_t val_row, size_t val_col,
-                               void *ctx, bool (*visit)(void *ctx, size_t row)) {
+void table_find_matching_rows(const Table *t, size_t col, const Table *val_t, RowRef val_row, size_t val_col,
+                               void *ctx, bool (*visit)(void *ctx, RowRef row)) {
     if (t->types[col] != val_t->types[val_col]) return;
     if (table_is_null(val_t, val_row, val_col)) return;
 
+    size_t val_row_raw = row_ref_raw(val_row);
     for (size_t r = 0; r < t->n_rows; r++) {
-        if (dead_test(t, r) || table_is_null(t, r, col)) continue;
-        if (cell_equal(t, r, col, val_t, val_row, val_col))
-            if (!visit(ctx, r)) return;
+        if (dead_test(t, r) || table_is_null(t, row_ref(r), col)) continue;
+        if (cell_equal(t, r, col, val_t, val_row_raw, val_col))
+            if (!visit(ctx, row_ref(r))) return;
     }
+}
+
+/* See table.h's doc comment - this and table_find_by_pk_hash are the only
+ * sanctioned way for anything outside table.c to touch the PK index; both
+ * used to be interp.c reaching directly into t->pk_index and calling
+ * row_index_usable/row_index_find itself. */
+bool table_pk_index_usable(const Table *t) {
+    return row_index_usable(&t->pk_index);
+}
+
+void table_find_by_pk_hash(const Table *t, uint64_t hash, void *ctx, bool (*visit)(void *ctx, RowRef row)) {
+    row_index_find(&t->pk_index, hash, ctx, visit);
 }
 
 void table_compact(Table *t) {
@@ -525,8 +554,8 @@ void table_compact(Table *t) {
     if (t->pk_col >= 0) {
         row_index_clear(&t->pk_index);
         for (size_t row = 0; row < t->n_rows; row++) {
-            if (table_is_null(t, row, (size_t)t->pk_col)) continue;
-            row_index_insert(&t->pk_index, &t->arena, cell_hash(t, row, (size_t)t->pk_col), row);
+            if (table_is_null(t, row_ref(row), (size_t)t->pk_col)) continue;
+            row_index_insert(&t->pk_index, &t->arena, cell_hash(t, row, (size_t)t->pk_col), row_ref(row));
         }
     }
 }

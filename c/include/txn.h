@@ -27,7 +27,7 @@ typedef struct {
     UndoKind    kind;
     size_t      table_idx;
     const char *table_name;
-    size_t      row;
+    RowRef      row;
 
     /* UNDO_UPDATE only - the cell's value from just before it was
      * overwritten, restored verbatim on rollback. TEXT is captured as a
@@ -57,13 +57,13 @@ void txn_term(Txn *txn);
 
 bool txn_begin(Txn *txn, char *err, size_t err_len);
 
-bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, size_t row);
+bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, RowRef row);
 /* table is the same table table_idx resolves to right now - passed
  * separately (not re-derived from catalog here) because txn_log_update
  * needs to read the cell's current value immediately, before it's
  * overwritten, and the caller already has the pointer in hand. */
-bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, size_t row, size_t col);
-bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, size_t row);
+bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, RowRef row, size_t col);
+bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, RowRef row);
 
 /* Undoes every logged change, most recently logged first, then clears the
  * log and deactivates the txn. catalog resolves each entry's table_idx to

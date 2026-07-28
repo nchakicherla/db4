@@ -6,7 +6,7 @@ static bool needs_grow(const RowIndex *idx) {
     return idx->cap == 0 || idx->count >= idx->cap / 4 * 3;
 }
 
-static void raw_insert(RowIndex *idx, uint64_t hash, size_t row) {
+static void raw_insert(RowIndex *idx, uint64_t hash, RowRef row) {
     size_t mask = idx->cap - 1;
     size_t i = hash & mask;
     while (idx->slots[i].occupied) i = (i + 1) & mask;
@@ -31,7 +31,7 @@ static bool grow(RowIndex *idx, Arena *a) {
     return true;
 }
 
-void row_index_insert(RowIndex *idx, Arena *a, uint64_t hash, size_t row) {
+void row_index_insert(RowIndex *idx, Arena *a, uint64_t hash, RowRef row) {
     if (needs_grow(idx) && !grow(idx, a)) {
         idx->degraded = true;
         return;
@@ -44,7 +44,7 @@ bool row_index_usable(const RowIndex *idx) {
     return !idx->degraded;
 }
 
-void row_index_find(const RowIndex *idx, uint64_t hash, void *ctx, bool (*visit)(void *ctx, size_t row)) {
+void row_index_find(const RowIndex *idx, uint64_t hash, void *ctx, bool (*visit)(void *ctx, RowRef row)) {
     if (idx->cap == 0) return;
 
     size_t mask = idx->cap - 1;

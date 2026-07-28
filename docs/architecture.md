@@ -215,3 +215,7 @@ reasoning. The next planned architectural change is replacing CSV+WAL
 with real page storage (fixed-size pages, a table b-tree keyed by rowid,
 and index b-trees) — deliberately deferred until CSV's rewrite-on-commit
 cost is an actual bottleneck rather than a hypothetical one.
+
+That migration now has its own staged plan in
+[persistence_progression.md](persistence_progression.md), which is the
+working document to develop against.

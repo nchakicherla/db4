@@ -14,7 +14,7 @@
  * touched this table: a small bounded append instead of a whole-table
  * dump_csv rewrite. Frames encode absolute final state per row (not a
  * delta), so replaying a frame twice is harmless. */
-bool wal_append(const char *wal_path, const Table *t, const size_t *rows, size_t n_rows);
+bool wal_append(const char *wal_path, const Table *t, const RowRef *rows, size_t n_rows);
 
 /* Replays every well-formed frame in wal_path (a no-op, returning true,
  * if the file doesn't exist) onto an already-loaded table, in append

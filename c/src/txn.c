@@ -38,7 +38,7 @@ bool txn_begin(Txn *txn, char *err, size_t err_len) {
     return true;
 }
 
-bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, size_t row) {
+bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, RowRef row) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_INSERT;
@@ -48,7 +48,7 @@ bool txn_log_insert(Txn *txn, size_t table_idx, const char *table_name, size_t r
     return true;
 }
 
-bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, size_t row, size_t col) {
+bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_name, RowRef row, size_t col) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_UPDATE;
@@ -71,7 +71,7 @@ bool txn_log_update(Txn *txn, Table *table, size_t table_idx, const char *table_
     return true;
 }
 
-bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, size_t row) {
+bool txn_log_delete(Txn *txn, size_t table_idx, const char *table_name, RowRef row) {
     UndoEntry *e = push(txn);
     if (!e) return false;
     e->kind       = UNDO_DELETE;

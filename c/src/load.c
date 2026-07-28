@@ -9,6 +9,7 @@
 #include "arena.h"
 #include "budget.h"
 #include "csv.h"
+#include "cursor.h"
 #include "field.h"
 #include "lock.h"
 #include "schema.h"
@@ -25,7 +26,7 @@ static void usage_load(void) {
  * without setting anything when field doesn't validate against type -
  * load_row counts these so load_csv can warn instead of reporting a clean
  * load that quietly dropped data (see load_row/load_csv). */
-static bool set_cell(Table *t, size_t row, size_t col, const char *field) {
+static bool set_cell(Table *t, RowRef row, size_t col, const char *field) {
     FieldType type = t->types[col];
     if (!field_validate(field, type)) return false;
 
@@ -39,21 +40,21 @@ static bool set_cell(Table *t, size_t row, size_t col, const char *field) {
     return true;
 }
 
-static bool check_primary_key(const Table *t, size_t row, size_t col) {
+static bool check_primary_key(const Table *t, RowRef row, size_t col) {
     if (!table_is_primary_key(t, col)) return true;
 
     if (table_is_null(t, row, col)) {
-        printf("row %zu: primary key column \"%s\" cannot be NULL\n", row, t->names[col]);
+        printf("row %zu: primary key column \"%s\" cannot be NULL\n", row_ref_raw(row), t->names[col]);
         return false;
     }
     if (table_column_has_duplicate(t, col, row)) {
-        printf("row %zu: duplicate value in primary key column \"%s\"\n", row, t->names[col]);
+        printf("row %zu: duplicate value in primary key column \"%s\"\n", row_ref_raw(row), t->names[col]);
         return false;
     }
     return true;
 }
 
-static bool check_row_constraints(Table *t, size_t row, Table *const *fk_ref_table, const int *fk_ref_col) {
+static bool check_row_constraints(Table *t, RowRef row, Table *const *fk_ref_table, const int *fk_ref_col) {
     for (size_t col = 0; col < t->n_cols; col++) {
         if (!check_primary_key(t, row, col)) return false;
 
@@ -64,7 +65,7 @@ static bool check_row_constraints(Table *t, size_t row, Table *const *fk_ref_tab
                 const char *ref_table_name, *ref_column_name;
                 table_get_foreign_key(t, col, &ref_table_name, &ref_column_name);
                 printf("row %zu: value in foreign key column \"%s\" not found in %s.%s\n",
-                       row, t->names[col], ref_table_name, ref_column_name);
+                       row_ref_raw(row), t->names[col], ref_table_name, ref_column_name);
                 return false;
             }
         }
@@ -72,16 +73,16 @@ static bool check_row_constraints(Table *t, size_t row, Table *const *fk_ref_tab
     return true;
 }
 
-static size_t load_row(Table *t, const CsvRow *row, size_t *out_coerced) {
+static RowRef load_row(Table *t, const CsvRow *row, size_t *out_coerced) {
     size_t n = row->count < t->n_cols ? row->count : t->n_cols;
-    size_t r = table_append_row(t);
-    if (r == SIZE_MAX) return SIZE_MAX;
+    RowRef r = table_append_row(t);
+    if (!row_ref_valid(r)) return ROW_REF_INVALID;
 
     for (size_t i = 0; i < n; i++) {
         if (row->fields[i][0] == '\0' && !row->quoted[i]) continue;
         if (!set_cell(t, r, i, row->fields[i])) (*out_coerced)++;
     }
-    return table_failed(t) ? SIZE_MAX : r;
+    return table_failed(t) ? ROW_REF_INVALID : r;
 }
 
 static bool fk_chain_reaches(const Catalog *catalog, const Table *ref_table, const char *target, size_t depth_left) {
@@ -403,8 +404,8 @@ bool load_csv(Catalog *catalog, bool txn_active, const char *args) {
     arena_term(&schema_arena);
 
     size_t n_coerced = 0;
-    size_t r = load_row(&new_table, &first, &n_coerced);
-    if (r == SIZE_MAX) goto oom;
+    RowRef r = load_row(&new_table, &first, &n_coerced);
+    if (!row_ref_valid(r)) goto oom;
     if (!check_row_constraints(&new_table, r, fk_ref_table, fk_ref_col)) goto fail;
     size_t n_loaded = 1;
 
@@ -422,8 +423,8 @@ bool load_csv(Catalog *catalog, bool txn_active, const char *args) {
             printf("line %zu: %s\n", csv_reader_error_line(&reader), csv_reader_error(&reader));
             continue;
         }
-        size_t rr = load_row(&new_table, &row, &n_coerced);
-        if (rr == SIZE_MAX) goto oom;
+        RowRef rr = load_row(&new_table, &row, &n_coerced);
+        if (!row_ref_valid(rr)) goto oom;
         if (!check_row_constraints(&new_table, rr, fk_ref_table, fk_ref_col)) goto fail;
         n_loaded++;
     }
@@ -500,7 +501,7 @@ static bool write_csv_field(FILE *f, const char *s, size_t len) {
     return fputc('"', f) != EOF;
 }
 
-static bool dump_cell(FILE *f, const Table *t, size_t row, size_t col) {
+static bool dump_cell(FILE *f, const Table *t, RowRef row, size_t col) {
     if (table_is_null(t, row, col)) return true;
 
     char buf[64];
@@ -530,8 +531,10 @@ static bool write_csv_body(FILE *f, const Table *t, const char *path) {
     }
     fputc('\n', f);
 
-    for (size_t row = 0; row < t->n_rows; row++) {
-        if (table_row_is_dead(t, row)) continue;
+    Cursor cur;
+    cursor_init(&cur, t);
+    RowRef row;
+    while (cursor_next(&cur, &row)) {
         for (size_t col = 0; col < t->n_cols; col++) {
             if (col) fputc(',', f);
             if (!dump_cell(f, t, row, col)) {

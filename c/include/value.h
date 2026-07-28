@@ -34,7 +34,7 @@ Value value_bool(bool v);
 Value value_text(const char *s, size_t len);
 Value value_null(FieldType kind);
 
-Value read_column(const Table *t, size_t row, size_t col);
+Value read_column(const Table *t, RowRef row, size_t col);
 
 int compare_values(Value a, Value b);
 

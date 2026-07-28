@@ -65,7 +65,7 @@ static uint32_t frame_checksum(uint32_t row, uint8_t kind, const uint8_t *payloa
     return fnv1a_update(h, payload, payload_len);
 }
 
-static bool encode_row(ByteBuf *payload, const Table *t, size_t row) {
+static bool encode_row(ByteBuf *payload, const Table *t, RowRef row) {
     for (size_t col = 0; col < t->n_cols; col++) {
         uint8_t is_null = table_is_null(t, row, col) ? 1 : 0;
         if (!buf_append(payload, &is_null, 1)) return false;
@@ -136,7 +136,7 @@ static bool write_frame(FILE *f, uint32_t row, uint8_t kind, const ByteBuf *payl
     return true;
 }
 
-bool wal_append(const char *wal_path, const Table *t, const size_t *rows, size_t n_rows) {
+bool wal_append(const char *wal_path, const Table *t, const RowRef *rows, size_t n_rows) {
     if (n_rows == 0) return true;
 
     FILE *f = fopen(wal_path, "ab");
@@ -163,15 +163,15 @@ bool wal_append(const char *wal_path, const Table *t, const size_t *rows, size_t
     }
 
     for (size_t i = 0; i < n_rows && ok; i++) {
-        size_t row = rows[i];
+        RowRef row = rows[i];
 
         if (table_row_is_dead(t, row)) {
-            ok = write_frame(f, (uint32_t)row, WAL_FRAME_TOMBSTONE, NULL);
+            ok = write_frame(f, (uint32_t)row_ref_raw(row), WAL_FRAME_TOMBSTONE, NULL);
             continue;
         }
 
         ByteBuf payload = {0};
-        ok = encode_row(&payload, t, row) && write_frame(f, (uint32_t)row, WAL_FRAME_ROW, &payload);
+        ok = encode_row(&payload, t, row) && write_frame(f, (uint32_t)row_ref_raw(row), WAL_FRAME_ROW, &payload);
         free(payload.data);
     }
 
@@ -209,7 +209,7 @@ bool wal_append(const char *wal_path, const Table *t, const size_t *rows, size_t
  * fingerprint alone. Returns false the moment a read wouldn't fit, so the
  * caller can treat this frame like a torn one - stop replay here, keep
  * whatever was already applied. */
-static bool apply_row_payload(Table *t, size_t row, const uint8_t *payload, uint32_t payload_len) {
+static bool apply_row_payload(Table *t, RowRef row, const uint8_t *payload, uint32_t payload_len) {
     table_undelete_row(t, row);
 
     size_t off = 0;
@@ -321,10 +321,10 @@ bool wal_replay(const char *wal_path, Table *t) {
         }
         if (frame_checksum(row32, kind, payload, payload_len) != checksum) { free(payload); break; }
 
-        size_t row = row32;
+        RowRef row = row_ref((size_t)row32);
         bool grow_failed = false;
-        while (t->n_rows <= row) {
-            if (table_append_row(t) == SIZE_MAX) { grow_failed = true; break; }
+        while (t->n_rows <= row_ref_raw(row)) {
+            if (!row_ref_valid(table_append_row(t))) { grow_failed = true; break; }
         }
         if (grow_failed) { free(payload); oom = true; break; }
 

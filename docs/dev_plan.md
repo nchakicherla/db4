@@ -609,12 +609,18 @@ cost, so there's nothing concrete yet pushing on it.
     `sqlite3_reset` rather than sqlite3's separate `sqlite3_clear_bindings`
     - there's no equivalent of the latter here yet, nothing has asked for
     it.
-- **Page storage (not started)**: replacing CSV+WAL with a fixed-size-page
-  file format (page size, free list, a table b-tree keyed by rowid), with
-  indexes (b-tree on a declared column) becoming viable once storage is
-  page-based. Still gated on an actual bottleneck showing up - CSV import/
-  export would become a feature (`.import`/`.dump`-equivalent) rather than
-  the storage engine itself whenever this does get built.
+- **Page storage (planned, staged)**: replacing CSV+WAL with a
+  fixed-size-page file format (page size, free list, a table b-tree keyed
+  by rowid), with indexes (b-tree on a declared column) becoming viable
+  once storage is page-based. CSV import/export becomes a feature
+  (`.import`/`.dump`-equivalent) rather than the storage engine itself.
+  This is large enough to need its own sequencing, so it now has a
+  dedicated staged plan in
+  [persistence_progression.md](persistence_progression.md) - eight stages
+  from narrowing the executor/storage seam through pager, record
+  encoding, b-tree, the swap itself, a page-level WAL, secondary
+  indexes, and finally CSV's demotion to an import format. The rowid
+  model and type-strictness open questions below are resolved there.
 
 ## Module map (new files this plan implies)
 

@@ -19,7 +19,7 @@ Value value_text(const char *s, size_t len) {
 
 Value value_null(FieldType kind) { Value r; r.kind = kind; r.is_null = true; return r; }
 
-Value read_column(const Table *t, size_t row, size_t col) {
+Value read_column(const Table *t, RowRef row, size_t col) {
     if (table_is_null(t, row, col)) return value_null(t->types[col]);
     switch (t->types[col]) {
         case FT_INT:    return value_int(table_get_int(t, row, col));

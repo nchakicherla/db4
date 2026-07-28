@@ -50,7 +50,7 @@ static bool is_arith_op(BinaryOp op) { return op == OP_ADD || op == OP_SUB || op
 typedef struct {
     const char  *alias; /* the table's own catalog name - no AS aliasing yet */
     const Table *table;
-    size_t       row;
+    RowRef       row;
 } RowSource;
 
 typedef struct {
@@ -369,7 +369,7 @@ static Value eval_value(const Expr *e, const RowCtx *ctx) {
  * (validate the just-modified row) - the same checks load.c's loader runs
  * per row, just against the catalog's current state instead of a
  * scratch table being built up. */
-static bool check_row_constraints(const Table *t, size_t row, const Catalog *catalog, char *err, size_t err_len) {
+static bool check_row_constraints(const Table *t, RowRef row, const Catalog *catalog, char *err, size_t err_len) {
     for (size_t col = 0; col < t->n_cols; col++) {
         if (table_is_primary_key(t, col)) {
             if (table_is_null(t, row, col)) {
@@ -409,7 +409,7 @@ static bool check_row_constraints(const Table *t, size_t row, const Catalog *cat
  * CREATE TABLE both require that), so this only has to look at t's own
  * pk_col. */
 static bool check_pk_not_referenced(const Catalog *catalog, const Table *t, const char *table_name,
-                                     size_t row, char *err, size_t err_len) {
+                                     RowRef row, char *err, size_t err_len) {
     if (t->pk_col < 0) return true;
     size_t col = (size_t)t->pk_col;
     if (table_is_null(t, row, col)) return true;
@@ -456,7 +456,7 @@ static bool expr_fits_column(const Expr *e, const RowCtx *ctx, FieldType col_typ
     return false;
 }
 
-static void assign_value(Table *t, size_t row, size_t col, Value v) {
+static void assign_value(Table *t, RowRef row, size_t col, Value v) {
     if (v.is_null) {
         table_set_null(t, row, col);
         return;
@@ -570,16 +570,16 @@ static const Expr *find_join_pk_equality(const Expr *e, const char *inner_alias,
 }
 
 typedef struct {
-    size_t *rows;
+    RowRef *rows;
     size_t  count, cap;
     bool    oom;
 } PkLookupRows;
 
-static bool collect_pk_row(void *ctx_, size_t row) {
+static bool collect_pk_row(void *ctx_, RowRef row) {
     PkLookupRows *ctx = ctx_;
     if (ctx->count == ctx->cap) {
         size_t  new_cap = ctx->cap ? ctx->cap * 2 : 4;
-        size_t *grown   = realloc(ctx->rows, new_cap * sizeof(size_t));
+        RowRef *grown   = realloc(ctx->rows, new_cap * sizeof(RowRef));
         if (!grown) { ctx->oom = true; return false; }
         ctx->rows = grown;
         ctx->cap  = new_cap;
@@ -599,8 +599,8 @@ static const Table *g_sort_table;
 static bool         g_sort_desc;
 
 static int join_sort_cmp(const void *pa, const void *pb) {
-    const size_t *ta = pa;
-    const size_t *tb = pb;
+    const RowRef *ta = pa;
+    const RowRef *tb = pb;
     Value va = read_column(g_sort_table, ta[g_sort_src], (size_t)g_sort_col);
     Value vb = read_column(g_sort_table, tb[g_sort_src], (size_t)g_sort_col);
 
@@ -650,7 +650,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
             }
 
     RowSource static_sources[MAX_JOIN_SOURCES];
-    for (size_t i = 0; i < n_sources; i++) static_sources[i] = (RowSource){ names[i], tables[i], 0 };
+    for (size_t i = 0; i < n_sources; i++) static_sources[i] = (RowSource){ names[i], tables[i], ROW_REF_INVALID };
     RowCtx static_ctx = { static_sources, n_sources, params, n_params };
 
     for (size_t j = 0; j < stmt->n_joins; j++) {
@@ -698,13 +698,13 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
         order_col = c;
     }
 
-    size_t width = n_sources;
-    size_t *cur = NULL;
+    size_t  width = n_sources;
+    RowRef *cur = NULL;
     size_t  cur_count = 0, cur_cap = 0;
 
     Value pk_lookup_value = value_null(FT_TEXT);
     bool  use_pk_lookup   = n_sources == 1 && tables[0]->pk_col >= 0 && stmt->where
-                          && row_index_usable(&tables[0]->pk_index)
+                          && table_pk_index_usable(tables[0])
                           && find_pk_equality(stmt->where, &static_ctx, tables[0]->names[tables[0]->pk_col],
                                               tables[0]->types[tables[0]->pk_col], &pk_lookup_value);
 
@@ -715,7 +715,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
          * WHERE re-check below (the same one a full scan already goes
          * through) is still the source of truth. */
         PkLookupRows collected = {0};
-        row_index_find(&tables[0]->pk_index, value_hash(pk_lookup_value), &collected, collect_pk_row);
+        table_find_by_pk_hash(tables[0], value_hash(pk_lookup_value), &collected, collect_pk_row);
         if (collected.oom) {
             snprintf(err, err_len, "out of memory");
             free(collected.rows);
@@ -724,11 +724,11 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
             return false;
         }
         for (size_t i = 0; i < collected.count; i++) {
-            size_t row = collected.rows[i];
+            RowRef row = collected.rows[i];
             if (table_row_is_dead(tables[0], row)) continue;
             if (cur_count == cur_cap) {
-                size_t new_cap = cur_cap ? cur_cap * 2 : 4;
-                size_t *grown = realloc(cur, new_cap * width * sizeof(size_t));
+                size_t  new_cap = cur_cap ? cur_cap * 2 : 4;
+                RowRef *grown = realloc(cur, new_cap * width * sizeof(RowRef));
                 if (!grown) {
                     snprintf(err, err_len, "out of memory");
                     free(collected.rows);
@@ -747,11 +747,11 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
     } else {
         Cursor c0;
         cursor_init(&c0, tables[0]);
-        size_t row0;
+        RowRef row0;
         while (cursor_next(&c0, &row0)) {
             if (cur_count == cur_cap) {
-                size_t new_cap = cur_cap ? cur_cap * 2 : 16;
-                size_t *grown = realloc(cur, new_cap * width * sizeof(size_t));
+                size_t  new_cap = cur_cap ? cur_cap * 2 : 16;
+                RowRef *grown = realloc(cur, new_cap * width * sizeof(RowRef));
                 if (!grown) {
                     snprintf(err, err_len, "out of memory");
                     free(cur);
@@ -768,8 +768,8 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
     }
 
     for (size_t j = 0; j < stmt->n_joins; j++) {
-        size_t filled = 1 + j;
-        size_t *next = NULL;
+        size_t  filled = 1 + j;
+        RowRef *next = NULL;
         size_t  next_count = 0, next_cap = 0;
 
         /* Index-accelerated join: if this step's ON clause has a top-level
@@ -792,11 +792,11 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
          * a cross-type ON clause falls back to the nested-loop scan below
          * instead of silently missing a true match. */
         const Expr *outer_key_expr = NULL;
-        if (tables[filled]->pk_col >= 0 && row_index_usable(&tables[filled]->pk_index)) {
+        if (tables[filled]->pk_col >= 0 && table_pk_index_usable(tables[filled])) {
             outer_key_expr = find_join_pk_equality(stmt->joins[j].on, names[filled], tables[filled]->names[tables[filled]->pk_col]);
             if (outer_key_expr) {
                 RowSource outer_sources[MAX_JOIN_SOURCES];
-                for (size_t s = 0; s < filled; s++) outer_sources[s] = (RowSource){ names[s], tables[s], 0 };
+                for (size_t s = 0; s < filled; s++) outer_sources[s] = (RowSource){ names[s], tables[s], ROW_REF_INVALID };
                 RowCtx      outer_only_ctx = { outer_sources, filled, params, n_params };
                 ExprValueType key_ty;
                 char           discard_err[64];
@@ -818,7 +818,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
                 if (key.is_null) continue; /* NULL never equals anything - no candidates */
 
                 PkLookupRows collected = {0};
-                row_index_find(&tables[filled]->pk_index, value_hash(key), &collected, collect_pk_row);
+                table_find_by_pk_hash(tables[filled], value_hash(key), &collected, collect_pk_row);
                 if (collected.oom) {
                     snprintf(err, err_len, "out of memory");
                     free(collected.rows);
@@ -830,7 +830,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
                 }
 
                 for (size_t k = 0; k < collected.count; k++) {
-                    size_t jrow = collected.rows[k];
+                    RowRef jrow = collected.rows[k];
                     if (table_row_is_dead(tables[filled], jrow)) continue;
 
                     probe[filled] = (RowSource){ names[filled], tables[filled], jrow };
@@ -838,8 +838,8 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
                     if (eval_tri(stmt->joins[j].on, &probe_ctx) != TRI_TRUE) continue;
 
                     if (next_count == next_cap) {
-                        size_t new_cap = next_cap ? next_cap * 2 : 16;
-                        size_t *grown = realloc(next, new_cap * width * sizeof(size_t));
+                        size_t  new_cap = next_cap ? next_cap * 2 : 16;
+                        RowRef *grown = realloc(next, new_cap * width * sizeof(RowRef));
                         if (!grown) {
                             snprintf(err, err_len, "out of memory");
                             free(collected.rows);
@@ -862,7 +862,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
 
             Cursor cj;
             cursor_init(&cj, tables[filled]);
-            size_t jrow;
+            RowRef jrow;
             while (cursor_next(&cj, &jrow)) {
                 probe[filled] = (RowSource){ names[filled], tables[filled], jrow };
                 RowCtx probe_ctx = { probe, filled + 1, params, n_params };
@@ -870,8 +870,8 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
                 if (eval_tri(stmt->joins[j].on, &probe_ctx) != TRI_TRUE) continue;
 
                 if (next_count == next_cap) {
-                    size_t new_cap = next_cap ? next_cap * 2 : 16;
-                    size_t *grown = realloc(next, new_cap * width * sizeof(size_t));
+                    size_t  new_cap = next_cap ? next_cap * 2 : 16;
+                    RowRef *grown = realloc(next, new_cap * width * sizeof(RowRef));
                     if (!grown) {
                         snprintf(err, err_len, "out of memory");
                         free(next);
@@ -893,7 +893,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
         cur_count = next_count;
     }
 
-    size_t *matched = NULL;
+    RowRef *matched = NULL;
     size_t  n_matched = 0, mcap = 0;
     for (size_t i = 0; i < cur_count; i++) {
         if (stmt->where) {
@@ -903,8 +903,8 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
             if (eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
         }
         if (n_matched == mcap) {
-            size_t new_cap = mcap ? mcap * 2 : 16;
-            size_t *grown = realloc(matched, new_cap * width * sizeof(size_t));
+            size_t  new_cap = mcap ? mcap * 2 : 16;
+            RowRef *grown = realloc(matched, new_cap * width * sizeof(RowRef));
             if (!grown) {
                 snprintf(err, err_len, "out of memory");
                 free(matched);
@@ -916,7 +916,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
             matched = grown;
             mcap    = new_cap;
         }
-        memcpy(&matched[n_matched * width], &cur[i * width], width * sizeof(size_t));
+        memcpy(&matched[n_matched * width], &cur[i * width], width * sizeof(RowRef));
         n_matched++;
     }
     free(cur);
@@ -926,7 +926,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
         g_sort_col   = order_col;
         g_sort_table = tables[order_src];
         g_sort_desc  = stmt->order_desc;
-        if (n_matched) qsort(matched, n_matched, width * sizeof(size_t), join_sort_cmp); /* matched is NULL when n_matched == 0 */
+        if (n_matched) qsort(matched, n_matched, width * sizeof(RowRef), join_sort_cmp); /* matched is NULL when n_matched == 0 */
     }
 
     size_t n_out = n_matched;
@@ -968,7 +968,7 @@ static bool exec_select_plain(const SelectStmt *stmt, const Catalog *catalog, co
     if (n_cols > 0 && !row_buf) goto oom;
 
     for (size_t i = 0; i < n_out; i++) {
-        const size_t *tuple = &matched[i * width];
+        const RowRef *tuple = &matched[i * width];
         size_t k = 0;
         if (stmt->columns.is_star) {
             for (size_t s = 0; s < n_sources; s++)
@@ -1004,8 +1004,8 @@ static const int   *g_group_cols;
 static size_t       g_group_n;
 
 static int group_key_cmp(const void *pa, const void *pb) {
-    size_t ra = *(const size_t *)pa;
-    size_t rb = *(const size_t *)pb;
+    RowRef ra = *(const RowRef *)pa;
+    RowRef rb = *(const RowRef *)pb;
     for (size_t i = 0; i < g_group_n; i++) {
         Value va = read_column(g_group_table, ra, (size_t)g_group_cols[i]);
         Value vb = read_column(g_group_table, rb, (size_t)g_group_cols[i]);
@@ -1019,7 +1019,7 @@ static int group_key_cmp(const void *pa, const void *pb) {
     return 0;
 }
 
-static bool group_key_equal(const Table *t, const int *cols, size_t n_cols, size_t ra, size_t rb) {
+static bool group_key_equal(const Table *t, const int *cols, size_t n_cols, RowRef ra, RowRef rb) {
     for (size_t i = 0; i < n_cols; i++) {
         Value va = read_column(t, ra, (size_t)cols[i]);
         Value vb = read_column(t, rb, (size_t)cols[i]);
@@ -1047,7 +1047,7 @@ static bool build_group_col_names(ResultSet *rs, const SelectStmt *stmt) {
 }
 
 static bool build_group_row(ResultSet *rs, const SelectStmt *stmt, const Table *t, const int *item_col,
-                             const bool *item_is_group, const size_t *rows, size_t count) {
+                             const bool *item_is_group, const RowRef *rows, size_t count) {
     size_t n_items = stmt->columns.count;
     Value *row_buf = malloc(n_items * sizeof(Value));
     if (!row_buf) return false;
@@ -1116,7 +1116,7 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
     }
     const Table *t = &catalog->tables[t_idx].table;
 
-    RowSource src0       = { stmt->table, t, 0 };
+    RowSource src0       = { stmt->table, t, ROW_REF_INVALID };
     RowCtx    static_ctx = { &src0, 1, params, n_params };
 
     if (stmt->columns.is_star) {
@@ -1205,11 +1205,11 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
 
     if (stmt->where && !validate_where(stmt->where, &static_ctx, err, err_len)) goto fail;
 
-    size_t *rows = NULL;
+    RowRef *rows = NULL;
     size_t  n_rows = 0, cap = 0;
     Cursor cur;
     cursor_init(&cur, t);
-    size_t row;
+    RowRef row;
     while (cursor_next(&cur, &row)) {
         if (stmt->where) {
             RowSource s   = { stmt->table, t, row };
@@ -1217,8 +1217,8 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
             if (eval_tri(stmt->where, &ctx) != TRI_TRUE) continue;
         }
         if (n_rows == cap) {
-            size_t new_cap = cap ? cap * 2 : 16;
-            size_t *grown = realloc(rows, new_cap * sizeof(size_t));
+            size_t  new_cap = cap ? cap * 2 : 16;
+            RowRef *grown = realloc(rows, new_cap * sizeof(RowRef));
             if (!grown) {
                 snprintf(err, err_len, "out of memory");
                 free(rows);
@@ -1234,7 +1234,7 @@ static bool exec_select_grouped(const SelectStmt *stmt, const Catalog *catalog, 
         g_group_table = t;
         g_group_cols  = gb_cols;
         g_group_n     = stmt->n_group_by;
-        qsort(rows, n_rows, sizeof(size_t), group_key_cmp);
+        qsort(rows, n_rows, sizeof(RowRef), group_key_cmp);
     }
 
     if (!result_set_init(out_rs, n_items) || !build_group_col_names(out_rs, stmt)) {
@@ -1368,8 +1368,8 @@ static bool interp_exec_insert(const InsertStmt *stmt, Catalog *catalog, Txn *tx
             }
         }
 
-        size_t row = table_append_row(t);
-        if (row == SIZE_MAX || table_failed(t)) {
+        RowRef row = table_append_row(t);
+        if (!row_ref_valid(row) || table_failed(t)) {
             snprintf(err, err_len, "out of memory inserting into %s", stmt->table);
             goto fail;
         }
@@ -1412,7 +1412,7 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     }
     Table *t = &catalog->tables[t_idx].table;
 
-    RowSource src0       = { stmt->table, t, 0 };
+    RowSource src0       = { stmt->table, t, ROW_REF_INVALID };
     RowCtx    static_ctx = { &src0, 1, params, n_params };
 
     int *cols = malloc(stmt->n_assignments * sizeof(int));
@@ -1458,7 +1458,7 @@ static bool interp_exec_update(const UpdateStmt *stmt, Catalog *catalog, Txn *tx
     size_t n_updated = 0;
     Cursor cur;
     cursor_init(&cur, t);
-    size_t row;
+    RowRef row;
     while (cursor_next(&cur, &row)) {
         RowSource src = { stmt->table, t, row };
         RowCtx    ctx = { &src, 1, params, n_params };
@@ -1509,7 +1509,7 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
     }
     Table *t = &catalog->tables[t_idx].table;
 
-    RowSource src0       = { stmt->table, t, 0 };
+    RowSource src0       = { stmt->table, t, ROW_REF_INVALID };
     RowCtx    static_ctx = { &src0, 1, params, n_params };
     if (stmt->where && !validate_where(stmt->where, &static_ctx, err, err_len)) return false;
 
@@ -1523,7 +1523,7 @@ static bool interp_exec_delete(const DeleteStmt *stmt, Catalog *catalog, Txn *tx
     size_t n_deleted = 0;
     Cursor cur;
     cursor_init(&cur, t);
-    size_t row;
+    RowRef row;
     while (cursor_next(&cur, &row)) {
         RowSource src = { stmt->table, t, row };
         RowCtx    ctx = { &src, 1, params, n_params };
@@ -1662,7 +1662,7 @@ static bool interp_exec_create_table(const CreateTableStmt *stmt, Catalog *catal
  * the append (M7) so a concurrent reader's `.load` snapshot (a shared
  * lock, see load.c) never observes a torn WAL write. */
 static bool commit_wal_for_table(Catalog *catalog, Table *table, const char *table_name,
-                                  const size_t *rows, size_t n_rows, char *err, size_t err_len) {
+                                  const RowRef *rows, size_t n_rows, char *err, size_t err_len) {
     int idx = catalog_find(catalog, table_name);
     if (idx < 0 || !catalog->tables[idx].path) return true; /* no backing file - nothing to persist */
 
@@ -1743,7 +1743,7 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
             if (txn->log[j].table_idx == table_idx) { table_seen_before = true; break; }
         if (table_seen_before) continue;
 
-        size_t *rows = malloc(txn->count * sizeof(size_t));
+        RowRef *rows = malloc(txn->count * sizeof(RowRef));
         if (!rows) {
             snprintf(err, err_len, "out of memory");
             return false;
@@ -1752,10 +1752,10 @@ static bool interp_exec_commit(Catalog *catalog, Txn *txn, char *err, size_t err
         size_t n_rows = 0;
         for (size_t j = i; j < txn->count; j++) {
             if (txn->log[j].table_idx != table_idx) continue;
-            size_t row = txn->log[j].row;
-            bool   dup = false;
+            RowRef row = txn->log[j].row;
+            bool    dup = false;
             for (size_t k = 0; k < n_rows; k++)
-                if (rows[k] == row) { dup = true; break; }
+                if (row_ref_eq(rows[k], row)) { dup = true; break; }
             if (!dup) rows[n_rows++] = row;
         }
 

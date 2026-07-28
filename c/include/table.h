@@ -68,26 +68,26 @@ bool table_take_failure(Table *t);
 
 int table_find_column(const Table *t, const char *name);
 
-size_t table_append_row(Table *t);
-void   table_delete_row(Table *t, size_t row);
-void   table_undelete_row(Table *t, size_t row);
-bool   table_row_is_dead(const Table *t, size_t row);
+RowRef table_append_row(Table *t);
+void   table_delete_row(Table *t, RowRef row);
+void   table_undelete_row(Table *t, RowRef row);
+bool   table_row_is_dead(const Table *t, RowRef row);
 
-void table_set_null(Table *t, size_t row, size_t col);
-bool table_is_null(const Table *t, size_t row, size_t col);
+void table_set_null(Table *t, RowRef row, size_t col);
+bool table_is_null(const Table *t, RowRef row, size_t col);
 
-void table_set_int(Table *t, size_t row, size_t col, int64_t v);
-void table_set_double(Table *t, size_t row, size_t col, double v);
-void table_set_bool(Table *t, size_t row, size_t col, bool v);
-void table_set_text(Table *t, size_t row, size_t col, const char *s, size_t len);
+void table_set_int(Table *t, RowRef row, size_t col, int64_t v);
+void table_set_double(Table *t, RowRef row, size_t col, double v);
+void table_set_bool(Table *t, RowRef row, size_t col, bool v);
+void table_set_text(Table *t, RowRef row, size_t col, const char *s, size_t len);
 
-int64_t     table_get_int(const Table *t, size_t row, size_t col);
-double      table_get_double(const Table *t, size_t row, size_t col);
-bool        table_get_bool(const Table *t, size_t row, size_t col);
-const char *table_get_text(const Table *t, size_t row, size_t col, size_t *out_len);
+int64_t     table_get_int(const Table *t, RowRef row, size_t col);
+double      table_get_double(const Table *t, RowRef row, size_t col);
+bool        table_get_bool(const Table *t, RowRef row, size_t col);
+const char *table_get_text(const Table *t, RowRef row, size_t col, size_t *out_len);
 
-StringRef table_get_text_ref(const Table *t, size_t row, size_t col);
-void      table_set_text_ref(Table *t, size_t row, size_t col, StringRef ref);
+StringRef table_get_text_ref(const Table *t, RowRef row, size_t col);
+void      table_set_text_ref(Table *t, RowRef row, size_t col, StringRef ref);
 
 void table_set_foreign_key(Table *t, size_t col, const char *ref_table, const char *ref_column,
                             FkAction on_delete, FkAction on_update);
@@ -100,12 +100,25 @@ FkAction table_get_on_update(const Table *t, size_t col);
 void table_set_primary_key(Table *t, size_t col);
 bool table_is_primary_key(const Table *t, size_t col);
 
-bool table_column_has_duplicate(const Table *t, size_t col, size_t row);
+bool table_column_has_duplicate(const Table *t, size_t col, RowRef row);
 
-bool table_has_matching_value(const Table *ref_t, size_t ref_col, const Table *t, size_t row, size_t col);
+bool table_has_matching_value(const Table *ref_t, size_t ref_col, const Table *t, RowRef row, size_t col);
 
-void table_find_matching_rows(const Table *t, size_t col, const Table *val_t, size_t val_row, size_t val_col,
-                               void *ctx, bool (*visit)(void *ctx, size_t row));
+void table_find_matching_rows(const Table *t, size_t col, const Table *val_t, RowRef val_row, size_t val_col,
+                               void *ctx, bool (*visit)(void *ctx, RowRef row));
+
+/* Wraps table.c's own PK hash index (never exposed directly - callers
+ * above the storage engine have no business knowing whether a lookup is
+ * backed by a hash table, a b-tree, or anything else). table_pk_index_usable
+ * gates the fast path exactly like row_index_usable did; table_find_by_pk_hash
+ * probes it for every row whose primary-key cell hashes to hash - a
+ * hash-bucket match, not a value match, so the caller must still re-check
+ * the real predicate against every visited row (a collision or a stale
+ * entry can only produce a spurious candidate, never a missed real match -
+ * see docs/persistence_progression.md and the PK-index commit history for
+ * why). Only meaningful once t->pk_col >= 0. */
+bool table_pk_index_usable(const Table *t);
+void table_find_by_pk_hash(const Table *t, uint64_t hash, void *ctx, bool (*visit)(void *ctx, RowRef row));
 
 size_t table_add_column(Table *t, const char *name, FieldType type);
 

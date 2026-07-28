@@ -73,6 +73,21 @@ make
 Produces `bin/main`, a REPL over the public API. `make debug` builds an
 unoptimized, symbol-ful binary; `make clean` removes build output.
 
+## Embedding db4 in another project
+
+`make lib` builds `bin/libdb4.a` - everything `bin/main` links minus
+`main.c` itself and the vendored `linenoise` (that's the REPL's own line
+editor; nothing else touches it). Link it into another project instead of
+copying db4's sources into that project's build:
+
+```bash
+cc -Iinclude your_app.c path/to/db4/c/bin/libdb4.a -lm -o your_app
+```
+
+Only `-Iinclude` and `-lm` are needed - `sds`/`cJSON` are internal to
+`csv.c`/`schema.c` and never appear in a header `db4.h` transitively
+includes, so an embedder never needs `-Iexternal/*`.
+
 ## Using the REPL
 
 ```

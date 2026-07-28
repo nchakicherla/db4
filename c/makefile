@@ -28,13 +28,27 @@ endif
 SRC = $(wildcard src/*.c) external/linenoise/linenoise.c external/sds/sds.c external/cJSON/cJSON.c
 OBJ = $(SRC:%.c=obj/%.o)
 
-.PHONY: all run debug clean
+# Everything bin/main links minus main.c itself and linenoise (main.c's own
+# REPL line-editing - no other file touches it). This is the public db4.h
+# surface plus its real dependencies (sds/cJSON stay internal to csv.c/
+# schema.c and never appear in a header db4.h transitively includes), so an
+# embedder only needs -Iinclude and this archive - never -Iexternal/*.
+LIB_OBJ = $(filter-out obj/src/main.o obj/external/linenoise/%.o,$(OBJ))
+LIB_STATIC = bin/libdb4.a
+
+.PHONY: all lib run debug clean
 
 all: $(TARGET)
+
+lib: $(LIB_STATIC)
 
 $(TARGET): $(OBJ)
 	mkdir -p bin
 	$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS)
+
+$(LIB_STATIC): $(LIB_OBJ)
+	mkdir -p bin
+	ar rcs $@ $(LIB_OBJ)
 
 # linenoise uses non-standard termios/ioctl calls -Wpedantic flags; needs
 # _GNU_SOURCE for some platforms' terminal handling.

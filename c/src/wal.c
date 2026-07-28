@@ -43,13 +43,26 @@ static bool buf_append(ByteBuf *b, const void *p, size_t n) {
     return true;
 }
 
-static uint32_t fnv1a(const uint8_t *data, size_t len) {
-    uint32_t h = 2166136261u;
+static uint32_t fnv1a_update(uint32_t h, const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         h ^= data[i];
         h *= 16777619u;
     }
     return h;
+}
+
+static uint32_t fnv1a(const uint8_t *data, size_t len) {
+    return fnv1a_update(2166136261u, data, len);
+}
+
+/* Folds row and kind into the running hash ahead of the payload so a flipped
+ * row number or kind byte fails checksum verification exactly like a
+ * corrupted payload does, instead of silently replaying onto the wrong row
+ * or under the wrong frame kind. */
+static uint32_t frame_checksum(uint32_t row, uint8_t kind, const uint8_t *payload, size_t payload_len) {
+    uint32_t h = fnv1a_update(2166136261u, (const uint8_t *)&row, sizeof row);
+    h = fnv1a_update(h, &kind, sizeof kind);
+    return fnv1a_update(h, payload, payload_len);
 }
 
 static bool encode_row(ByteBuf *payload, const Table *t, size_t row) {
@@ -112,7 +125,7 @@ static uint32_t schema_fingerprint(const Table *t) {
 static bool write_frame(FILE *f, uint32_t row, uint8_t kind, const ByteBuf *payload) {
     uint32_t magic       = WAL_MAGIC;
     uint32_t payload_len = payload ? (uint32_t)payload->len : 0;
-    uint32_t checksum    = payload ? fnv1a(payload->data, payload->len) : 0;
+    uint32_t checksum    = frame_checksum(row, kind, payload ? payload->data : NULL, payload_len);
 
     if (fwrite(&magic, sizeof magic, 1, f) != 1) return false;
     if (fwrite(&row, sizeof row, 1, f) != 1) return false;
@@ -305,8 +318,8 @@ bool wal_replay(const char *wal_path, Table *t) {
             payload = malloc(payload_len);
             if (!payload) { oom = true; break; }
             if (fread(payload, 1, payload_len, f) != payload_len) { free(payload); break; }
-            if (fnv1a(payload, payload_len) != checksum) { free(payload); break; }
         }
+        if (frame_checksum(row32, kind, payload, payload_len) != checksum) { free(payload); break; }
 
         size_t row = row32;
         bool grow_failed = false;
@@ -378,8 +391,17 @@ bool wal_checkpoint(const char *csv_path, const char *wal_path, Table *t) {
      * it from scratch alongside reclaiming dead rows. Safe here
      * specifically because cmd_checkpoint already refuses to run this
      * while a transaction is open (see main.c) - nothing holds a row
-     * number across the renumbering this performs. */
+     * number across the renumbering this performs.
+     *
+     * table_compact_heap belongs right alongside it for the same reason:
+     * its own contract (include/txn.h) is that it must never run while a
+     * transaction's undo log holds a StringRef into the old heap, and
+     * "no open transaction" is exactly what cmd_checkpoint already
+     * guarantees here. Without this call the TEXT heap - append-only by
+     * design - only ever grows, even across checkpoints. */
     table_compact(t);
+    table_compact_heap(t);
+    if (table_failed(t)) return false; /* e.g. a TEXT heap rebuild ran out of memory */
 
     if (!dump_csv(t, csv_path)) return false;
     if (remove(wal_path) != 0 && errno != ENOENT) return false;
